@@ -1,0 +1,10 @@
+.pio/
+.vscode/
+.idea/
+include/secrets.h
+*.bin
+*.elf
+*.map
+*.log
+*.pyc
+__pycache__/
