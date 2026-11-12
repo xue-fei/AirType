@@ -1,0 +1,14 @@
+/target
+**/target
+*.dll
+*.lib
+*.exp
+*.pdb
+*.exe
+.DS_Store
+.idea/
+.vscode/
+*.log
+config/local.toml
+__pycache__/
+*.pyc

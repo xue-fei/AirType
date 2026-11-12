@@ -1,0 +1,31 @@
+# 示例：用 command 引擎接真实 ASR（默认 tools/asr_bridge.py 是占位实现）
+# 使用：cargo run -p airtype-daemon -- config/airtype-command.toml
+# 把 command 换成 whisper.cpp / faster-whisper CLI / 云端 SDK 脚本即可。
+
+[server]
+bind = "127.0.0.1"
+port = 8765
+path = "/ws"
+
+[audio]
+sample_rate = 16000
+channels = 1
+bits_per_sample = 16
+frame_ms = 20
+max_utterance_ms = 60000
+
+[asr]
+engine = "command"
+command = "python tools/asr_bridge.py {wav}"
+timeout_ms = 20000
+
+[postprocess]
+trim_filler_words = true
+normalize_numbers = true
+ensure_punctuation = true
+collapse_whitespace = true
+
+[inject]
+mode = "none"
+restore_clipboard = true
+paste_delay_ms = 40

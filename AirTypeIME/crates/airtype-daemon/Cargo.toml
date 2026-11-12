@@ -1,0 +1,26 @@
+[package]
+name = "airtype-daemon"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "AirTypeIME WebSocket server, session orchestration and text injection"
+
+[lib]
+name = "airtype_daemon"
+path = "src/lib.rs"
+
+[[bin]]
+name = "airtype-daemon"
+path = "src/main.rs"
+
+[dependencies]
+airtype-core = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+anyhow = "1"
+arboard = "3"
+futures-util = "0.3"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time", "signal", "io-util"] }
+tokio-tungstenite = "0.24"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

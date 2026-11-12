@@ -1,0 +1,17 @@
+[package]
+name = "airtype-ffi"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "C ABI (cdylib) for AirTypeIME native IME shells: TSF / IMK / Fcitx5"
+
+[lib]
+name = "airtype_ffi"
+crate-type = ["cdylib"]
+
+[dependencies]
+airtype-core = { workspace = true }
+airtype-daemon = { workspace = true }
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "net", "time", "macros"] }
+tracing = { workspace = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

@@ -1,0 +1,36 @@
+# AirTypeIME 默认配置
+# 局域网内让 AirMic Node 直连时，把 bind 改成 "0.0.0.0"
+
+[server]
+bind = "127.0.0.1"
+port = 8765
+path = "/ws"
+
+[audio]
+sample_rate = 16000
+channels = 1
+bits_per_sample = 16
+frame_ms = 20
+max_utterance_ms = 60000
+
+[asr]
+# mock | command
+engine = "mock"
+# command 模式：把 {wav} 替换成临时 WAV 路径，进程 stdout 首行作为识别文本
+command = "python tools/asr_bridge.py {wav}"
+timeout_ms = 20000
+mock_text = "你好，这是一次 AirType 语音输入测试。"
+
+[postprocess]
+trim_filler_words = true
+normalize_numbers = true
+ensure_punctuation = true
+collapse_whitespace = true
+
+[inject]
+# none | clipboard_paste
+# none：只把最终文本写进日志，不碰系统剪贴板和按键（无头验证用）
+# clipboard_paste：保存剪贴板 -> 写入文本 -> 模拟 Ctrl+V -> 恢复剪贴板
+mode = "none"
+restore_clipboard = true
+paste_delay_ms = 40
