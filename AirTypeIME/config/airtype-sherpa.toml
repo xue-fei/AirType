@@ -1,0 +1,76 @@
+# AirTypeIME 流式识别配置：内嵌 sherpa-onnx（fp32），边说边出字
+#
+# 启动 daemon（模型在 daemon 进程内加载，不需要额外服务）
+#   cargo run -p airtype-daemon -- config/airtype-sherpa.toml
+#
+# 看实时上屏效果
+#   python tools/mock_airmic.py --wav sample.wav
+#   python tools/bench_latency.py --wav sample.wav --count 5
+#
+# 首次构建需要 sherpa-onnx 预编译库（约 118MB）：
+#   tools/fetch_sherpa_libs.sh       # 或手动下载，见 README 第 6 节
+#
+# 与 airtype.toml 的唯一区别是 [streaming] enabled = true：
+# 关掉它就退回「松键后整段解码」的旧路径，其余配置完全通用。
+
+[server]
+bind = "127.0.0.1"   # AirMic 真连时改成 "0.0.0.0"
+port = 8765
+path = "/ws"
+
+[audio]
+sample_rate = 16000
+channels = 1
+bits_per_sample = 16
+frame_ms = 20
+max_utterance_ms = 60000
+
+[asr]
+# mock | command | sherpa
+engine = "sherpa"
+command = "python tools/asr_bridge.py {wav}"
+mock_text = "你好，这是一次 AirType 语音输入测试。"
+
+[sherpa]
+# 模型目录：自动扫描 encoder/decoder/joiner 的 fp32 版本与 tokens.txt。
+model_dir = "models/sherpa-onnx-streaming-zipformer-bilingual-zh-en-2023-02-20"
+# 显式指定文件（相对 model_dir 或绝对路径）；留空则自动解析。
+# 注意：只接受 fp32，指向量化文件会直接报错。
+encoder = ""
+decoder = ""
+joiner = ""
+tokens = ""
+num_threads = 4
+provider = "cpu"
+modeling_unit = "cjkchar"
+decoding_method = "greedy_search"
+# AirType 用 PTT 松键收尾，不靠端点检测
+enable_endpoint = false
+
+[streaming]
+# true：START 开流，AUDIO 按 chunk_ms 增量解码，END 收尾
+enabled = true
+# 攒够多少毫秒的增量音频做一次增量解码。
+# 太小解码频繁、太大首字延迟变差；16kHz/单声道下 200ms ≈ 3200 samples。
+chunk_ms = 200
+# true：partial 变化时按最长公共前缀「退格 + 追加」实时上屏（需可覆盖式注入）；
+# false：partial 只回传给上层，松键后一次性注入完整文本（注入更便宜，
+#        但没有实时效果）。
+replace = true
+
+[postprocess]
+trim_filler_words = true
+normalize_numbers = true
+# 整段收尾才补句末标点；partial 阶段用 process_partial，不补标点，
+# 避免输入框里标点反复闪烁。
+ensure_punctuation = true
+collapse_whitespace = true
+
+[inject]
+# none：只写日志（无头验证）。
+# clipboard_paste：partial 阶段用「模拟退格 N 次 + Ctrl+V」覆盖式上屏。
+#   注意副作用：会反复占用剪贴板，且要求焦点窗口的光标位置不动；
+#   正规解法是 TSF composition（预编辑串），需要 C++ COM 外壳。
+mode = "none"
+restore_clipboard = true
+paste_delay_ms = 40

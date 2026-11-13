@@ -20,6 +20,10 @@ pub struct Config {
     #[serde(default)]
     pub asr: AsrConfig,
     #[serde(default)]
+    pub sherpa: SherpaConfig,
+    #[serde(default)]
+    pub streaming: StreamingConfig,
+    #[serde(default)]
     pub postprocess: PostProcessConfig,
     #[serde(default)]
     pub inject: InjectConfig,
@@ -51,7 +55,7 @@ pub struct AudioConfig {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct AsrConfig {
-    /// `mock` | `command`
+    /// `mock` | `command` | `sherpa`
     #[serde(default = "default_engine")]
     pub engine: String,
     /// `command` 模式的命令模板，`{wav}` 会替换成临时 WAV 路径（路径含空格也安全）。
@@ -61,6 +65,57 @@ pub struct AsrConfig {
     pub timeout_ms: u64,
     #[serde(default = "default_mock_text")]
     pub mock_text: String,
+}
+
+/// 内嵌 sherpa-onnx 引擎参数（`asr.engine = "sherpa"` 时生效）。
+#[derive(Debug, Clone, Deserialize)]
+pub struct SherpaConfig {
+    /// 模型目录，缺省指向仓库内已下载的 fp32 流式 zipformer。
+    #[serde(default = "default_sherpa_model_dir")]
+    pub model_dir: String,
+    /// 显式指定 encoder 文件（相对 `model_dir` 或绝对路径）。留空则自动扫目录。
+    #[serde(default)]
+    pub encoder: String,
+    /// 显式指定 decoder 文件。留空则自动扫目录。
+    #[serde(default)]
+    pub decoder: String,
+    /// 显式指定 joiner 文件。留空则自动扫目录。
+    #[serde(default)]
+    pub joiner: String,
+    /// 显式指定 tokens 文件。留空则自动找 `tokens.txt`。
+    #[serde(default)]
+    pub tokens: String,
+    /// ONNX Runtime 线程数。
+    #[serde(default = "default_sherpa_num_threads")]
+    pub num_threads: i32,
+    /// 执行提供器，本机 CPU 用 `cpu`。
+    #[serde(default = "default_sherpa_provider")]
+    pub provider: String,
+    /// 建模单元，中英混说用 `cjkchar`。
+    #[serde(default = "default_sherpa_modeling_unit")]
+    pub modeling_unit: String,
+    /// 解码方法：`greedy_search` 或 `modified_beam_search`。
+    #[serde(default = "default_sherpa_decoding_method")]
+    pub decoding_method: String,
+    /// 是否启用端点检测。AirType 用 PTT 松键收尾，保持 false。
+    #[serde(default)]
+    pub enable_endpoint: bool,
+}
+
+/// 流式识别（边说边出字）参数。`streaming.enabled` 为 true 时生效；
+/// 关掉即回到「松键后整段解码」的旧路径。
+#[derive(Debug, Clone, Deserialize)]
+pub struct StreamingConfig {
+    #[serde(default = "default_streaming_enabled")]
+    pub enabled: bool,
+    /// 攒够多少毫秒的增量音频请求一次识别。太小则请求频繁，
+    /// 太大则首字延迟变差；16kHz/单声道下 200ms ≈ 3200 samples。
+    #[serde(default = "default_chunk_ms")]
+    pub chunk_ms: u32,
+    /// true：partial 变化时按最长公共前缀撤销重写，实时上屏（需可覆盖式注入）；
+    /// false：partial 只回传给上层，松键后一次性注入完整文本。
+    #[serde(default = "default_replace")]
+    pub replace: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -92,6 +147,8 @@ impl Default for Config {
             server: ServerConfig::default(),
             audio: AudioConfig::default(),
             asr: AsrConfig::default(),
+            sherpa: SherpaConfig::default(),
+            streaming: StreamingConfig::default(),
             postprocess: PostProcessConfig::default(),
             inject: InjectConfig::default(),
         }
@@ -137,6 +194,23 @@ defaults!(AsrConfig,
     timeout_ms: default_timeout_ms(),
     mock_text: default_mock_text(),
 );
+defaults!(SherpaConfig,
+    model_dir: default_sherpa_model_dir(),
+    encoder: String::new(),
+    decoder: String::new(),
+    joiner: String::new(),
+    tokens: String::new(),
+    num_threads: default_sherpa_num_threads(),
+    provider: default_sherpa_provider(),
+    modeling_unit: default_sherpa_modeling_unit(),
+    decoding_method: default_sherpa_decoding_method(),
+    enable_endpoint: false,
+);
+defaults!(StreamingConfig,
+    enabled: default_streaming_enabled(),
+    chunk_ms: default_chunk_ms(),
+    replace: default_replace(),
+);
 defaults!(PostProcessConfig,
     trim_filler_words: true,
     normalize_numbers: true,
@@ -179,6 +253,30 @@ fn default_engine() -> String {
 fn default_command() -> String {
     "python tools/asr_bridge.py {wav}".into()
 }
+fn default_sherpa_model_dir() -> String {
+    "models/sherpa-onnx-streaming-zipformer-bilingual-zh-en-2023-02-20".into()
+}
+fn default_sherpa_num_threads() -> i32 {
+    4
+}
+fn default_sherpa_provider() -> String {
+    "cpu".into()
+}
+fn default_sherpa_modeling_unit() -> String {
+    "cjkchar".into()
+}
+fn default_sherpa_decoding_method() -> String {
+    "greedy_search".into()
+}
+fn default_streaming_enabled() -> bool {
+    false
+}
+fn default_chunk_ms() -> u32 {
+    200
+}
+fn default_replace() -> bool {
+    true
+}
 fn default_timeout_ms() -> u64 {
     20_000
 }
@@ -206,6 +304,45 @@ mod tests {
         assert_eq!(c.audio.sample_rate, 16000);
         assert_eq!(c.asr.engine, "mock");
         assert_eq!(c.inject.mode, "none");
+        assert!(!c.streaming.enabled, "默认整段解码，不启用流式");
+    }
+
+    #[test]
+    fn streaming_config_is_parsed() {
+        let c = Config::from_toml(
+            "[asr]\nengine = \"sherpa\"\n\n[streaming]\nenabled = true\nchunk_ms = 250\nreplace = false\n",
+        )
+        .unwrap();
+        assert!(c.streaming.enabled);
+        assert_eq!(c.streaming.chunk_ms, 250);
+        assert!(!c.streaming.replace, "replace=false 时只提交稳定段");
+    }
+
+    #[test]
+    fn sherpa_config_defaults_are_safe() {
+        let s = SherpaConfig::default();
+        assert!(s.model_dir.contains("streaming-zipformer"));
+        assert_eq!(s.num_threads, 4);
+        assert_eq!(s.provider, "cpu");
+        assert_eq!(s.modeling_unit, "cjkchar");
+        assert_eq!(s.decoding_method, "greedy_search");
+        assert!(!s.enable_endpoint, "PTT 松键收尾，不靠端点检测");
+    }
+
+    #[test]
+    fn sherpa_section_overrides_only_given_fields() {
+        let c = Config::from_toml("[sherpa]\nnum_threads = 8\n").unwrap();
+        assert_eq!(c.sherpa.num_threads, 8);
+        assert_eq!(c.sherpa.provider, "cpu");
+        assert_eq!(c.asr.engine, "mock", "未指定的段保持默认");
+    }
+
+    #[test]
+    fn streaming_defaults_are_safe() {
+        let s = StreamingConfig::default();
+        assert!(!s.enabled);
+        assert_eq!(s.chunk_ms, 200);
+        assert!(s.replace);
     }
 
     #[test]

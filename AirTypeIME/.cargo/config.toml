@@ -1,0 +1,8 @@
+# sherpa-onnx-sys 的 build.rs 在编译期要拿到预编译 native 库（约 118MB）。
+# 默认从 GitHub releases 下载；网络受限时先跑 tools/fetch_sherpa_libs.sh，
+# 这里指向仓库内的归档目录（相对本配置文件所在目录解析）。
+#
+# 注意：指向的目录里必须有与 cargo 版本匹配的归档文件，否则编译会失败并
+# 提示运行 tools/fetch_sherpa_libs.sh。
+[env]
+SHERPA_ONNX_ARCHIVE_DIR = { value = "vendor/sherpa-libs", relative = true }

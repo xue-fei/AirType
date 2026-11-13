@@ -1,0 +1,12 @@
+[package]
+name = "airtype-asr-sherpa"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "AirTypeIME in-process sherpa-onnx ASR engine (fp32 streaming zipformer)"
+
+[dependencies]
+airtype-core = { workspace = true }
+sherpa-onnx = "2.0.1"
+thiserror = { workspace = true }
+tracing = { workspace = true }

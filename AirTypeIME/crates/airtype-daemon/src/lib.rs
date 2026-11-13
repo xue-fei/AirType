@@ -3,11 +3,13 @@
 //! 平台相关的编排层：WebSocket 服务、会话调度、文本注入。
 //! 业务逻辑全部委托给 `airtype-core`，这里只负责 I/O 与系统能力。
 
+pub mod engines;
 pub mod inject;
 pub mod server;
 
 use std::sync::Arc;
 
+pub use engines::build as build_engines;
 pub use inject::{build_injector, TextInjector};
 pub use server::run_server;
 

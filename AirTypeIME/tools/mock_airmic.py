@@ -17,9 +17,11 @@ import base64
 import json
 import math
 import os
+import select
 import socket
 import struct
 import sys
+import threading
 import time
 import wave
 
@@ -158,6 +160,73 @@ def wav_chunks(path: str, frame_ms: int):
             yield data
 
 
+class StatusReader(threading.Thread):
+    """后台读帧：流式模式下 partial 状态在推音途中就会到达，必须边推边读。"""
+
+    def __init__(self, ws, started_at, on_exit):
+        super().__init__(daemon=True)
+        self.ws = ws
+        self.started_at = started_at
+        self.on_exit = on_exit
+        self.stop = threading.Event()
+        self.first_partial_ms = None
+        self.final_text = None
+        self.final_timings = None
+        self.saw_done = False
+
+    def run(self):
+        # 用 select 轮询而不是改套接字超时：发送和接收共用一个 socket，
+        # 把超时调小会让主线程的 sendall 一起超时。
+        while not self.stop.is_set():
+            try:
+                ready, _, _ = select.select([self.ws.sock], [], [], 0.2)
+            except (OSError, ValueError):
+                break
+            if not ready:
+                continue
+            try:
+                opcode, payload = self.ws.recv_frame()
+            except socket.timeout:
+                continue
+            except (OSError, RuntimeError):
+                break
+            if opcode != 0x2:
+                continue
+            kind, body = parse_frame(payload)
+            if kind == KIND_STATUS:
+                self._on_status(body)
+            elif kind == KIND_TEXT:
+                self.final_text = body.decode("utf-8")
+                print("[TEXT]  ", self.final_text, flush=True)
+                if self.saw_done:
+                    break
+            elif kind == KIND_PONG:
+                print("[PONG]", flush=True)
+        self.on_exit()
+
+    def _on_status(self, body):
+        status = json.loads(body.decode("utf-8"))
+        state = status.get("state")
+        if state == "partial":
+            if self.first_partial_ms is None:
+                self.first_partial_ms = (time.perf_counter() - self.started_at) * 1000
+            print(
+                "[PARTIAL %6.0fms] %s"
+                % ((time.perf_counter() - self.started_at) * 1000, status.get("text", "")),
+                flush=True,
+            )
+            return
+        if state == "done":
+            self.saw_done = True
+            self.final_timings = status.get("timings")
+            # 空语音段不会发 TEXT 帧，直接收尾。
+            if status.get("message") == "empty utterance":
+                self.on_exit()
+        elif state in ("cancelled", "error"):
+            self.on_exit()
+        print("[STATUS]", json.dumps(status, ensure_ascii=False), flush=True)
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="模拟 AirMic Node 推流")
     ap.add_argument("--host", default="127.0.0.1")
@@ -195,49 +264,45 @@ def main() -> int:
         return 1
 
     try:
+        exit_event = threading.Event()
+        started_at = time.perf_counter()
         seq = 0
         ws.send_binary(make_frame(KIND_START, seq, json.dumps(meta).encode("utf-8")))
         seq += 1
         print(f"START  device={args.device}  codec=pcm_s16le  {SAMPLE_RATE}Hz/16bit/mono")
+
+        reader = StatusReader(ws, started_at, exit_event.set)
+        reader.start()
 
         for chunk in chunks:
             ws.send_binary(make_frame(KIND_AUDIO, seq, chunk))
             seq = (seq + 1) & 0xFFFF
             if not args.fast:
                 time.sleep(args.frame_ms / 1000.0)
-        print(f"AUDIO  {len(chunks)} 帧 / {sum(len(c) // 2 for c in chunks)} samples")
+        total_samples = sum(len(c) // 2 for c in chunks)
+        print(f"AUDIO  {len(chunks)} 帧 / {total_samples} samples")
 
         tail_kind = KIND_CANCEL if args.cancel else KIND_END
         ws.send_binary(make_frame(tail_kind, seq))
         print("CANCEL" if args.cancel else "END")
 
         deadline = time.time() + args.timeout
-        done_seen = False
-        while time.time() < deadline:
-            try:
-                opcode, payload = ws.recv_frame()
-            except (socket.timeout, OSError, RuntimeError) as e:
-                print(f"等待响应结束: {e}", file=sys.stderr)
-                break
-            if opcode != 0x2:
-                continue
-            kind, body = parse_frame(payload)
-            if kind == KIND_STATUS:
-                status = json.loads(body.decode("utf-8"))
-                print("[STATUS]", json.dumps(status, ensure_ascii=False))
-                state = status.get("state")
-                if state in ("cancelled", "error"):
-                    break
-                if state == "done":
-                    # 服务端随后还会发一帧 TEXT；空语音段则没有，最多再等 1 秒。
-                    done_seen = True
-                    deadline = time.time() + 1.0
-            elif kind == KIND_TEXT:
-                print("[TEXT]  ", body.decode("utf-8"))
-                if done_seen:
-                    break
-            elif kind == KIND_PONG:
-                print("[PONG]")
+        while time.time() < deadline and not exit_event.is_set():
+            time.sleep(0.05)
+
+        reader.stop.set()
+        reader.join(timeout=2.0)
+
+        total_ms = (time.perf_counter() - started_at) * 1000
+        audio_ms = total_samples / SAMPLE_RATE * 1000
+        first = (
+            "%.0fms" % reader.first_partial_ms
+            if reader.first_partial_ms is not None
+            else "n/a"
+        )
+        print(f"首字={first}  总耗时={total_ms:.0f}ms  音频={audio_ms:.0f}ms")
+        if reader.final_timings:
+            print("timings:", json.dumps(reader.final_timings, ensure_ascii=False))
         return 0
     finally:
         ws.send_close()

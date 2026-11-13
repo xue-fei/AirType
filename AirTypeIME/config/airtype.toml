@@ -14,7 +14,7 @@ frame_ms = 20
 max_utterance_ms = 60000
 
 [asr]
-# mock | command
+# mock | command | sherpa（推荐，内嵌 sherpa-onnx，见 airtype-sherpa.toml）
 engine = "mock"
 # command 模式：把 {wav} 替换成临时 WAV 路径，进程 stdout 首行作为识别文本
 command = "python tools/asr_bridge.py {wav}"

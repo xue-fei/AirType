@@ -20,9 +20,11 @@ pub mod pipeline;
 pub mod postprocess;
 pub mod protocol;
 pub mod session;
+pub mod streaming;
 
 pub use asr::{build_engine, AsrEngine, MockAsr};
 pub use config::Config;
 pub use pipeline::{Pipeline, PipelineEvent, PipelineError};
-pub use protocol::{Frame, FrameKind, StartMeta, StatusPayload};
+pub use protocol::{Frame, FrameKind, StartMeta, StatusPayload, Timings};
 pub use session::{Session, SessionEvent, SessionState};
+pub use streaming::{build_streaming_engine, AsrStream, StreamOutcome, StreamingAsr};

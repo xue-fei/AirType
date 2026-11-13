@@ -4,6 +4,8 @@
 use crate::config::PostProcessConfig;
 
 const FILLERS: &[&str] = &["嗯", "啊", "呃", "这个", "那个", "然后", "就是说", "就是"];
+/// 只有语气词、没有任何实义内容时，整段视为无语音。
+const NON_SUBSTANTIVE: &[char] = &['嗯', '啊', '呃', '哦', '唔', '呵'];
 const END_PUNCT: &[char] = &[
     '。', '，', '、', '；', '：', '？', '！', '…', '”', '’', '）', ']', '}', '.', ',',
     ';', ':', '?', '!', ')',
@@ -19,6 +21,17 @@ impl PostProcessor {
     }
 
     pub fn process(&self, text: &str) -> String {
+        self.process_inner(text, true)
+    }
+
+    /// 流式中间结果专用：与 `process` 一致，但**不补句末标点**。
+    /// 中文流式识别的 partial 会反复改写，补标点会让末尾多一个字再被删掉，
+    /// 造成输入框里标点闪烁。标点只在最终文本上补。
+    pub fn process_partial(&self, text: &str) -> String {
+        self.process_inner(text, false)
+    }
+
+    fn process_inner(&self, text: &str, ensure_punct: bool) -> String {
         let mut s = text.trim().to_string();
         if s.is_empty() {
             return s;
@@ -35,11 +48,23 @@ impl PostProcessor {
         if self.cfg.collapse_whitespace {
             s = remove_cjk_spaces(&s);
         }
-        if self.cfg.ensure_punctuation {
+        if ensure_punct && self.cfg.ensure_punctuation {
             s = ensure_punctuation(&s);
         }
-        s.trim().to_string()
+        let s = s.trim();
+        // 真实 ASR（SenseVoice）对静音/纯音段会返回 "。" / "嗯。" 之类，
+        // 注入后只会在输入框留下垃圾标点。没有任何实义字符就丢掉整段。
+        if !has_substantive(s) {
+            return String::new();
+        }
+        s.to_string()
     }
+}
+
+/// 至少一个字母 / 数字 / 表意文字，且不全是语气词。
+fn has_substantive(s: &str) -> bool {
+    s.chars()
+        .any(|c| c.is_alphanumeric() && !NON_SUBSTANTIVE.contains(&c))
 }
 
 fn collapse_whitespace(s: &str) -> String {
@@ -168,5 +193,22 @@ mod tests {
     #[test]
     fn empty_input_stays_empty() {
         assert_eq!(default_pp().process("   "), "");
+    }
+
+    #[test]
+    fn drops_punctuation_and_filler_only_output() {
+        // 真实 ASR 对静音段常见的输出，不能注入到输入框
+        assert_eq!(default_pp().process("。"), "");
+        assert_eq!(default_pp().process("…"), "");
+        assert_eq!(default_pp().process("嗯。"), "");
+        assert_eq!(default_pp().process("?"), "");
+    }
+
+    #[test]
+    fn keeps_real_asr_text() {
+        assert_eq!(
+            default_pp().process("开饭时间早上9点至下午5点。"),
+            "开饭时间早上9点至下午5点。"
+        );
     }
 }

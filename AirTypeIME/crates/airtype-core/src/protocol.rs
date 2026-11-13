@@ -100,7 +100,27 @@ fn default_bits() -> u16 {
     16
 }
 
+/// 一次识别的各阶段耗时（毫秒），用于定位 0.3~1s 延迟目标的瓶颈。
+/// `asr/post/audio` 由 core 填，`inject/total` 由 daemon 填，
+/// `first_partial` 由 daemon 在流式模式下填（START 到首个 `Partial`）。
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Timings {
+    #[serde(default)]
+    pub asr_ms: u64,
+    #[serde(default)]
+    pub post_ms: u64,
+    #[serde(default)]
+    pub audio_ms: u64,
+    #[serde(default)]
+    pub inject_ms: u64,
+    #[serde(default)]
+    pub total_ms: u64,
+    #[serde(default)]
+    pub first_partial_ms: u64,
+}
+
 /// 服务端 `STATUS` 帧的 JSON payload。
+/// `timings` 是 v1.1 追加的可选字段：旧客户端只取 `state`，不受影响。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StatusPayload {
     pub state: String,
@@ -108,6 +128,8 @@ pub struct StatusPayload {
     pub text: String,
     #[serde(default)]
     pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timings: Option<Timings>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -193,10 +215,21 @@ impl Frame {
     }
 
     pub fn status(seq: u16, state: &str, text: &str, message: &str) -> Self {
+        Self::status_with_timings(seq, state, text, message, None)
+    }
+
+    pub fn status_with_timings(
+        seq: u16,
+        state: &str,
+        text: &str,
+        message: &str,
+        timings: Option<Timings>,
+    ) -> Self {
         let payload = serde_json::to_vec(&StatusPayload {
             state: state.to_owned(),
             text: text.to_owned(),
             message: message.to_owned(),
+            timings,
         })
         .unwrap_or_default();
         Self {
@@ -271,5 +304,38 @@ mod tests {
         assert_eq!(meta.sample_rate, 16000);
         assert_eq!(meta.channels, 1);
         assert_eq!(meta.bits_per_sample, 16);
+    }
+
+    #[test]
+    fn status_timings_are_optional_and_backward_compatible() {
+        let plain = Frame::status(1, "done", "你好", "");
+        let parsed: StatusPayload = serde_json::from_slice(&plain.payload).unwrap();
+        assert_eq!(parsed.state, "done");
+        assert!(parsed.timings.is_none());
+        // v1 客户端发来的旧 JSON 没有 timings 字段，仍要能反序列化。
+        let old: StatusPayload =
+            serde_json::from_str(r#"{"state":"done","text":"x","message":""}"#).unwrap();
+        assert!(old.timings.is_none());
+
+        let timed = Frame::status_with_timings(
+            2,
+            "done",
+            "你好",
+            "",
+            Some(Timings {
+                asr_ms: 120,
+                post_ms: 1,
+                audio_ms: 1500,
+                inject_ms: 80,
+                total_ms: 210,
+                first_partial_ms: 95,
+            }),
+        );
+        let parsed: StatusPayload = serde_json::from_slice(&timed.payload).unwrap();
+        let t = parsed.timings.unwrap();
+        assert_eq!(t.asr_ms, 120);
+        assert_eq!(t.total_ms, 210);
+        assert_eq!(t.audio_ms, 1500);
+        assert_eq!(t.first_partial_ms, 95);
     }
 }

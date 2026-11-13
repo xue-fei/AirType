@@ -1,10 +1,14 @@
-//! ASR 适配层：`AsrEngine` trait 与两种实现。
+//! ASR 适配层：`AsrEngine` trait 与两种内置实现。
 //!
 //! - `MockAsr`：默认，离线即可跑通整条链路。
 //! - `CommandAsr`：把一段 PCM 写成临时 WAV，交给外部命令（whisper.cpp /
 //!   faster-whisper CLI / 云端 SDK 脚本），取 stdout 首行作为识别文本。
+//!   **每段语音都冷启动一个进程**，真实模型下加载开销大，只适合调试。
 //!
-//! 后续要接云端 HTTP API，只需再实现一个 `AsrEngine`，上层完全不动。
+//! 生产用的本地离线引擎是 `airtype-asr-sherpa`（内嵌 sherpa-onnx），
+//! 由 `airtype-daemon` 负责装配，core 只定义 trait 与纯数据配置。
+//!
+//! 两种引擎都只依赖标准库，core 保持零异步运行时、零平台 API。
 
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -35,7 +39,8 @@ pub trait AsrEngine: Send + Sync {
     fn transcribe(&self, samples: &[i16], sample_rate: u32) -> Result<String, AsrError>;
 }
 
-/// 按配置构造引擎。
+/// 按配置构造引擎。内嵌 sherpa-onnx 引擎不在这里——core 不能依赖它的
+/// native 库，由 `airtype-daemon` 按 `asr.engine` 分发。
 pub fn build_engine(cfg: &AsrConfig) -> Result<Arc<dyn AsrEngine>, AsrError> {
     match cfg.engine.as_str() {
         "mock" | "" => Ok(Arc::new(MockAsr {
@@ -51,7 +56,7 @@ pub fn build_engine(cfg: &AsrConfig) -> Result<Arc<dyn AsrEngine>, AsrError> {
             }))
         }
         other => Err(AsrError::Config(format!(
-            "unknown asr engine `{other}` (supported: mock, command)"
+            "unknown asr engine `{other}` (supported: mock, command; sherpa 由 daemon 装配)"
         ))),
     }
 }
@@ -226,6 +231,21 @@ mod tests {
     }
 
     #[test]
+    fn sherpa_is_assembled_by_daemon_not_core() {
+        // core 不能依赖 sherpa-onnx 的 native 库，sherpa 引擎由 daemon 装配。
+        let mut cfg = AsrConfig::default();
+        cfg.engine = "sherpa".into();
+        let err = match build_engine(&cfg) {
+            Ok(_) => panic!("core 不应能装配 sherpa 引擎"),
+            Err(e) => e,
+        };
+        assert!(
+            err.to_string().contains("sherpa"),
+            "错误信息应指明由 daemon 装配: {err}"
+        );
+    }
+
+    #[test]
     fn empty_command_is_rejected() {
         let mut cfg = AsrConfig::default();
         cfg.engine = "command".into();
@@ -254,4 +274,5 @@ mod tests {
         let text = engine.transcribe(&vec![0i16; 320], 16000).unwrap();
         assert_eq!(text, "frames 320");
     }
+
 }
