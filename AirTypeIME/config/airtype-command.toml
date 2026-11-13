@@ -29,3 +29,9 @@ collapse_whitespace = true
 mode = "none"
 restore_clipboard = true
 paste_delay_ms = 40
+
+# 内置设置页面：浏览器打开 http://127.0.0.1:8766/ 改配置并保存
+[web]
+enabled = true
+bind = "127.0.0.1"
+port = 8766

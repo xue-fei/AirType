@@ -1,6 +1,8 @@
 //! TOML 配置。所有字段都有默认值，缺表/缺字段都能正常启动。
+//!
+//! 同时派生 `Serialize`，让设置页面能把当前配置写回 `airtype.toml`。
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -9,9 +11,11 @@ pub enum ConfigError {
     Io(#[from] std::io::Error),
     #[error("parse config: {0}")]
     Toml(#[from] toml::de::Error),
+    #[error("serialize config: {0}")]
+    TomlSerialize(#[from] toml::ser::Error),
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Config {
     #[serde(default)]
     pub server: ServerConfig,
@@ -27,9 +31,11 @@ pub struct Config {
     pub postprocess: PostProcessConfig,
     #[serde(default)]
     pub inject: InjectConfig,
+    #[serde(default)]
+    pub web: WebConfig,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ServerConfig {
     #[serde(default = "default_bind")]
     pub bind: String,
@@ -39,7 +45,7 @@ pub struct ServerConfig {
     pub path: String,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct AudioConfig {
     #[serde(default = "default_sample_rate")]
     pub sample_rate: u32,
@@ -53,7 +59,7 @@ pub struct AudioConfig {
     pub max_utterance_ms: u32,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct AsrConfig {
     /// `mock` | `command` | `sherpa`
     #[serde(default = "default_engine")]
@@ -68,7 +74,7 @@ pub struct AsrConfig {
 }
 
 /// 内嵌 sherpa-onnx 引擎参数（`asr.engine = "sherpa"` 时生效）。
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct SherpaConfig {
     /// 模型目录，缺省指向仓库内已下载的 fp32 流式 zipformer。
     #[serde(default = "default_sherpa_model_dir")]
@@ -104,7 +110,7 @@ pub struct SherpaConfig {
 
 /// 流式识别（边说边出字）参数。`streaming.enabled` 为 true 时生效；
 /// 关掉即回到「松键后整段解码」的旧路径。
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct StreamingConfig {
     #[serde(default = "default_streaming_enabled")]
     pub enabled: bool,
@@ -118,7 +124,7 @@ pub struct StreamingConfig {
     pub replace: bool,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct PostProcessConfig {
     #[serde(default = "yes")]
     pub trim_filler_words: bool,
@@ -130,7 +136,7 @@ pub struct PostProcessConfig {
     pub collapse_whitespace: bool,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct InjectConfig {
     /// `none` | `clipboard_paste`
     #[serde(default = "default_inject_mode")]
@@ -139,6 +145,20 @@ pub struct InjectConfig {
     pub restore_clipboard: bool,
     #[serde(default = "default_paste_delay_ms")]
     pub paste_delay_ms: u64,
+}
+
+/// 内置设置页面（daemon 里的手写 HTTP 服务）。
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct WebConfig {
+    /// 是否开启设置页面。默认开启，但只监听 127.0.0.1。
+    #[serde(default = "default_web_enabled")]
+    pub enabled: bool,
+    /// 监听地址。**保持 127.0.0.1**；改成 "0.0.0.0" 会让同局域网的人
+    /// 都能改你的 ASR 与注入设置。
+    #[serde(default = "default_web_bind")]
+    pub bind: String,
+    #[serde(default = "default_web_port")]
+    pub port: u16,
 }
 
 impl Default for Config {
@@ -151,6 +171,7 @@ impl Default for Config {
             streaming: StreamingConfig::default(),
             postprocess: PostProcessConfig::default(),
             inject: InjectConfig::default(),
+            web: WebConfig::default(),
         }
     }
 }
@@ -163,6 +184,18 @@ impl Config {
 
     pub fn from_toml(text: &str) -> Result<Self, ConfigError> {
         Ok(toml::from_str(text)?)
+    }
+
+    /// 写成 TOML（设置页面保存用）。所有字段都会输出，
+    /// 因此产物本身就是一份带注释锚点的完整配置。
+    pub fn to_toml(&self) -> Result<String, ConfigError> {
+        Ok(toml::to_string(self)?)
+    }
+
+    /// 读出来再写回去，保留未显式设置的默认值。
+    pub fn save(&self, path: impl AsRef<std::path::Path>) -> Result<(), ConfigError> {
+        std::fs::write(path, self.to_toml()?)?;
+        Ok(())
     }
 }
 
@@ -221,6 +254,11 @@ defaults!(InjectConfig,
     mode: default_inject_mode(),
     restore_clipboard: true,
     paste_delay_ms: default_paste_delay_ms(),
+);
+defaults!(WebConfig,
+    enabled: default_web_enabled(),
+    bind: default_web_bind(),
+    port: default_web_port(),
 );
 
 fn default_bind() -> String {
@@ -285,6 +323,15 @@ fn default_mock_text() -> String {
 }
 fn default_inject_mode() -> String {
     "none".into()
+}
+fn default_web_enabled() -> bool {
+    true
+}
+fn default_web_bind() -> String {
+    "127.0.0.1".into()
+}
+fn default_web_port() -> u16 {
+    8766
 }
 fn default_paste_delay_ms() -> u64 {
     40
@@ -351,5 +398,69 @@ mod tests {
         assert_eq!(c.asr.engine, "command");
         assert_eq!(c.asr.timeout_ms, 20_000);
         assert_eq!(c.server.port, 8765);
+    }
+
+    #[test]
+    fn web_config_defaults_to_localhost() {
+        let w = WebConfig::default();
+        assert!(w.enabled, "设置页面默认开启，方便发现");
+        assert_eq!(w.bind, "127.0.0.1", "默认只监听本机");
+        assert_eq!(w.port, 8766);
+
+        let c = Config::from_toml("").unwrap();
+        assert_eq!(c.web.bind, "127.0.0.1");
+        assert_eq!(c.web.port, 8766);
+    }
+
+    #[test]
+    fn web_config_is_parsed() {
+        let c = Config::from_toml("[web]\nenabled = false\nbind = \"0.0.0.0\"\nport = 9000\n")
+            .unwrap();
+        assert!(!c.web.enabled);
+        assert_eq!(c.web.bind, "0.0.0.0");
+        assert_eq!(c.web.port, 9000);
+    }
+
+    #[test]
+    fn to_toml_round_trip_preserves_values() {
+        let c = Config::from_toml(
+            "[server]\nport = 9000\n\n[asr]\nengine = \"command\"\n\n[streaming]\nenabled = true\n",
+        )
+        .unwrap();
+        let text = c.to_toml().unwrap();
+        let back = Config::from_toml(&text).unwrap();
+        assert_eq!(back.server.port, 9000);
+        assert_eq!(back.asr.engine, "command");
+        assert!(back.streaming.enabled);
+        assert_eq!(back.server.bind, "127.0.0.1", "未指定的字段保持默认");
+        assert_eq!(back.web.port, 8766);
+    }
+
+    #[test]
+    fn to_toml_emits_every_section() {
+        let text = Config::default().to_toml().unwrap();
+        for section in [
+            "[server]",
+            "[audio]",
+            "[asr]",
+            "[sherpa]",
+            "[streaming]",
+            "[postprocess]",
+            "[inject]",
+            "[web]",
+        ] {
+            assert!(text.contains(section), "写出内容缺少 {section}:\n{text}");
+        }
+    }
+
+    #[test]
+    fn empty_config_round_trips_through_writer() {
+        let c = Config::from_toml("").unwrap();
+        let back = Config::from_toml(&c.to_toml().unwrap()).unwrap();
+        assert_eq!(back.server.port, c.server.port);
+        assert_eq!(back.audio.sample_rate, c.audio.sample_rate);
+        assert_eq!(back.sherpa.model_dir, c.sherpa.model_dir);
+        assert_eq!(back.inject.mode, c.inject.mode);
+        assert_eq!(back.web.port, c.web.port);
     }
 }
