@@ -1,6 +1,55 @@
 # AirMic Node 接线说明
 
-主控：**ESP32-S3 Mini**（PlatformIO `esp32-s3-devkitc-1`；若用 Lolin S3 Mini / XIAO ESP32S3，改 `platformio.ini` 的 `board` 并核对引脚）。
+目标主控：**ESP32-S3 SuperMini**（ESP32-S3FH4R2，4MB Flash + 2MB PSRAM，原生 USB-C，板载 WS2812 在 GPIO48）。PlatformIO 环境见 `platformio.ini` 的 `[env:supermini]`。
+
+其他板（Lolin S3 Mini / XIAO ESP32S3 / DevKitC-1）把 `platformio.ini` 的 `default_envs` 改成 `esp32s3`，并核对本页末尾的「避开这些脚」。
+
+> ⚠️ **别和 ESP32-C3 SuperMini 搞混**：两者外形几乎一样，但 C3 版是 RISC-V **单核 160MHz**、400KB SRAM、**无 PSRAM**、只引出 13 个 GPIO（0–10、20、21，**GPIO12–17 被 Flash 占用**），板载灯是 **GPIO8 的蓝色单色 LED（低电平点亮）**，**没有 GPIO48**。本页所有配置（`qio_qspi` PSRAM、GPIO48 灯）都只适用于 **S3** 版。
+
+## ESP32-S3 SuperMini 兼容性
+
+**固件引脚与 SuperMini 完全兼容，无需改任何 GPIO**：
+
+| 功能 | GPIO | SuperMini 状况 |
+|---|---|---|
+| INMP441 `SCK` / BCLK | 4 | 安全 GPIO，已引出 |
+| INMP441 `WS` / LRCK | 5 | 安全 GPIO，已引出 |
+| INMP441 `SD` / DOUT | 6 | 安全 GPIO，已引出 |
+| PTT 按键 | 7 | 安全 GPIO，已引出 |
+| 单色状态灯（不用） | 2 | 安全 GPIO，已引出 |
+| **板载 WS2812** | **48** | **板载 RGB，正好对应** |
+
+SuperMini 已板载 **USB-C、LDO、BOOT 按键、WS2812**，所以外部只需接 **INMP441 + PTT 按键**。
+
+```
+ESP32-S3 SuperMini
+  ├─ 3V3  ─── INMP441 VDD   (+ 100nF 到 GND)
+  ├─ GND  ─── INMP441 GND
+  ├─ GPIO4 ─── INMP441 SCK
+  ├─ GPIO5 ─── INMP441 WS
+  ├─ GPIO6 ─── INMP441 SD
+  ├─ GND  ─── INMP441 L/R      ← 左声道
+  └─ GPIO7 ─── PTT 按键 ── GND  ← 内部上拉，不用外部元件
+  （WS2812 板载，无需接线；USB-C 供电 + 下载）
+```
+
+### 三个必须注意的点
+
+1. **引脚是 2.54mm 间距，半孔 + 通孔混合焊盘**：可以焊排针插面包板做原型，也可以贴焊在载板上。不需要强制画 PCB。
+2. **PSRAM 要在 `platformio.ini` 里显式声明**（已配好 `qio_qspi`）。本板是 **ESP32-S3FH4R2 = quad PSRAM**，`qio` 正确；只有换成 octal PSRAM 版本时才需要把 `board_build.arduino.memory_type` 改成 `opi_opi`、`board_build.psram_type` 改成 `opi`。若烧录后启动崩溃/反复重启，先核对芯片型号。
+3. **板载 WS2812 在 GPIO48**（与板载红色状态灯共用），这是 S3 SuperMini 的固定设计。若你的板子是 **ESP32-C3 SuperMini**（注意：C3 版完全不同，见下），板载灯是 GPIO8 的蓝色单色 LED，代码和引脚都要改。
+
+## 首次上电 / 配网
+
+上电后如果 NVS 里没有凭据，固件会进入**配网模式**：
+
+- 状态灯**青色慢闪**（单色 LED 为 1.6s 慢亮闪）
+- 开热点 `AirMic-XXXXXX`（XXXXXX = MAC 后 6 位），打开 <http://192.168.4.1/> 填 Wi-Fi
+- 也可以直接在串口发一行 `SSID:密码`，或 JSON `{"ssid":"..","pass":".."}`
+- 已有凭据时，**开机 250ms 内按住 PTT** 可强制重新配网
+- 等待上限 5 分钟，超时退回旧凭据（没有旧凭据就离线待机）
+
+详见 [../README.md](../README.md) 的「网络配置」一节。
 
 ## 引脚分配（`include/airmic_config.h`）
 
@@ -10,10 +59,10 @@
 | INMP441 `WS` / LRCK | 5 | `PIN_I2S_WS` |
 | INMP441 `SD` / DOUT | 6 | `PIN_I2S_DIN` |
 | PTT 按键 | 7 | `PIN_PTT` |
-| 单色状态灯 | 2 | `PIN_LED` |
-| WS2812 RGB（可选） | 48 | `PIN_WS2812` |
+| 单色状态灯（不用） | 2 | `PIN_LED` |
+| WS2812 RGB（板载） | 48 | `PIN_WS2812` |
 
-**避开这些脚**：GPIO0 / 3 / 45 / 46（strapping）、19 / 20（USB D-/D+）、26~32（Flash / PSRAM）、33~37（Octal PSRAM 板）。
+**避开这些脚**：GPIO0 / 3 / 45 / 46（strapping）、19 / 20（USB D-/D+，SuperMini 已接 USB-C）、26~32（Flash / PSRAM）、33~37（Octal PSRAM 板）。
 
 ## INMP441
 
@@ -61,6 +110,7 @@ LED 阴极 ─────────────── GND
 | 状态 | 单色 LED | WS2812 |
 |---|---|---|
 | 上电 | 200ms 快闪 | 蓝快闪 |
+| 配网中（SoftAP 已开） | 1.6s 慢亮闪 | 青慢闪 |
 | 连 Wi-Fi | 400ms 快闪 | 蓝快闪 |
 | Wi-Fi 已连 / WS 未连 | 1s 慢闪 | 紫慢闪 |
 | 待机（已连接） | 2s 心跳慢闪 | 绿心跳慢闪 |

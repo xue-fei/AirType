@@ -25,10 +25,19 @@
 #  define AIRTYPE_PATH "/ws"
 #endif
 
+// ---- 配网（SoftAP）----------------------------------------------------
+// 触发条件（见 main.cpp）：NVS 里没存过凭据且 secrets.h 也没填 SSID，
+// 或者开机 PTT_BOOT_HOLD_MS 内按住 PTT（强制重新配网）。
+// 配网热点 AirMic-XXXXXX 不加密，页面地址 http://192.168.4.1/
+static constexpr uint32_t PROVISION_TIMEOUT_MS = 300000; // 配网等待上限（5 分钟）
+static constexpr uint32_t PTT_BOOT_HOLD_MS     = 250;    // 开机按住 PTT 触发配网的窗口
+static constexpr uint16_t PROVISION_SCAN_MAX   = 12;     // 页面最多列出多少个附近热点
+
 // ---- 状态码/特性开关 --------------------------------------------------
-// 1 = 使用板载 WS2812 RGB 灯（GPIO 48 常见）；0 = 外接单色 LED + 限流电阻
+// 1 = 使用板载 WS2812 RGB 灯（ESP32-S3 SuperMini 的板载灯在 GPIO48）；
+// 0 = 外接单色 LED + 限流电阻（接 GPIO2）
 #ifndef AIRMIC_LED_WS2812
-#  define AIRMIC_LED_WS2812 0
+#  define AIRMIC_LED_WS2812 1
 #endif
 // 1 = 高电平点亮（LED 串电阻接 GND）；板载共阳 LED 改成 0
 #ifndef AIRMIC_LED_ACTIVE_HIGH
@@ -50,12 +59,20 @@
 
 // ---- 引脚 --------------------------------------------------------------
 // 避开 GPIO0/3/19/20/26..32/45/46（strapping、USB、Flash/PSRAM）。
+// ESP32-S3 SuperMini 的 4/5/6/7/2 都在安全 GPIO 列表内，无需改动。
 static constexpr int PIN_I2S_BCLK = 4;   // INMP441 SCK
 static constexpr int PIN_I2S_WS   = 5;   // INMP441 WS / LRCK
 static constexpr int PIN_I2S_DIN  = 6;   // INMP441 SD / DOUT
 static constexpr int PIN_PTT      = 7;   // 按键 -> GND
 static constexpr int PIN_LED      = 2;   // 单色状态灯（串 330Ω）
-static constexpr int PIN_WS2812  = 48;  // 板载 RGB（仅 AIRMIC_LED_WS2812=1 时有效）
+
+// 板载 WS2812 信号脚：ESP32-S3 SuperMini 固定在 GPIO48（与板载红色
+// 状态灯共用）。可在 secrets.h 里覆盖。
+// 注意：ESP32-C3 SuperMini 没有 GPIO48，板载的是 GPIO8 蓝色单色 LED，
+// 那种板型要改 AIRMIC_LED_WS2812=0 并把 PIN_LED 改成 8。
+#ifndef PIN_WS2812
+#  define PIN_WS2812 48
+#endif
 
 // ---- 音频 --------------------------------------------------------------
 // 协议 v1 固定：16kHz / 16bit / mono / S16LE，20ms 一帧。

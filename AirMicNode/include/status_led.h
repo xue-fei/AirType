@@ -12,6 +12,7 @@
 
 enum class LedState {
     Boot,
+    Provisioning,   // 配网中（SoftAP 已开）
     WifiConnecting,
     WifiReady,
     Idle,

@@ -16,8 +16,10 @@
 
 #include "airmic_config.h"
 #include "audio_capture.h"
+#include "credential_store.h"
 #include "net_client.h"
 #include "protocol.h"
+#include "provisioning.h"
 #include "ptt_button.h"
 #include "status_led.h"
 #include "wifi_manager.h"
@@ -53,15 +55,33 @@ void markError() {
     g_errorUntilMs = millis() + ERROR_LED_MS;
 }
 
+/// MAC 后 6 位，用于生成设备 ID 与配网热点名。
+String macSuffix() {
+    WiFi.mode(WIFI_STA);             // 打开射频才能读到 MAC
+    String mac = WiFi.macAddress();  // "AA:BB:CC:DD:EE:FF"
+    mac.replace(":", "");
+    return mac.substring(mac.length() > 6 ? mac.length() - 6 : 0);
+}
+
 String makeDeviceId() {
     if (std::strlen(AIRMIC_DEVICE_ID) > 0) {
         return String(AIRMIC_DEVICE_ID);
     }
-    String mac = WiFi.macAddress();  // "AA:BB:CC:DD:EE:FF"
-    mac.replace(":", "");
-    String suffix = mac.substring(mac.length() > 6 ? mac.length() - 6 : 0);
+    String suffix = macSuffix();
     suffix.toLowerCase();
     return "airmic-" + suffix;
+}
+
+/// 上电后短时间内按住 PTT = 强制进入配网模式。
+bool waitPttHold() {
+    const uint32_t until = millis() + PTT_BOOT_HOLD_MS;
+    while (millis() < until) {
+        button.update();
+        if (button.down()) {
+            return true;
+        }
+    }
+    return false;
 }
 
 /// 把采集队列里的 PCM 全部发出去。发 END 之前必须调用一次，
@@ -272,7 +292,46 @@ void setup() {
         markError();
     }
 
-    wifi.begin();  // 必须先初始化 Wi-Fi 才能读 MAC
+    // ---- Wi-Fi 凭据：NVS 优先，secrets.h 兜底，都没有则配网 ----
+    airmic::WifiCredentials creds;
+    bool haveCreds = CredentialStore::load(&creds);
+    if (!haveCreds && std::strlen(WIFI_SSID) > 0 &&
+        std::strcmp(WIFI_SSID, "YOUR_WIFI_SSID") != 0) {
+        creds.ssid = WIFI_SSID;
+        creds.pass = WIFI_PASS;
+        haveCreds = creds.valid();
+        if (haveCreds) {
+            Serial.println("[WiFi] NVS 无凭据，使用 secrets.h 里的配置");
+        }
+    }
+
+    // 已有凭据时，开机按住 PTT 强制重新配网（换路由器 / 纠正错误凭据）
+    bool forceProvisioning = !haveCreds;
+    if (haveCreds && waitPttHold()) {
+        Serial.println("[配网] 开机按住 PTT，强制进入配网模式");
+        forceProvisioning = true;
+    }
+
+    if (forceProvisioning) {
+        Provisioning prov;
+        const String apName = "AirMic-" + macSuffix();
+        if (prov.run(apName, led) == Provisioning::Result::Saved) {
+            // run() 返回前已写入 NVS，重启后生效（ESP.restart 不会返回）
+            ESP.restart();
+            return;
+        }
+        // 超时：有旧凭据就继续用，没有就离线待机
+        if (!CredentialStore::load(&creds)) {
+            creds = airmic::WifiCredentials();
+        }
+    }
+
+    if (creds.valid()) {
+        wifi.begin(creds);  // 必须先初始化 Wi-Fi 才能读 MAC
+    } else {
+        WiFi.mode(WIFI_STA);  // 不连接，只为读 MAC
+        Serial.println("[WiFi] 无可用凭据，离线待机（按住 PTT 开机可配网）");
+    }
     g_deviceId = makeDeviceId();
 
     net.onServerFrame(onServerFrame, nullptr);

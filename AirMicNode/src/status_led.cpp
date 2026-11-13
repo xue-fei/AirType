@@ -32,6 +32,7 @@ void StatusLed::set(LedState state) {
 bool StatusLed::litAt(LedState state, uint32_t phase) {
     switch (state) {
         case LedState::Boot:           return (phase % 200)  < 100;  // 快闪：上电
+        case LedState::Provisioning:   return (phase % 1600) < 200;  // 慢亮闪：配网中
         case LedState::WifiConnecting: return (phase % 400)  < 80;   // 快闪：连 Wi-Fi
         case LedState::WifiReady:      return (phase % 1000) < 80;   // 慢闪：WS 未连
         case LedState::Idle:           return (phase % 2000) < 60;   // 心跳慢闪：待机
@@ -53,6 +54,7 @@ void StatusLed::output(bool on, LedState state) {
     switch (state) {
         case LedState::Boot:
         case LedState::WifiConnecting: color = _px->Color(0, 0, 60);   break;  // 蓝
+        case LedState::Provisioning:   color = _px->Color(0, 45, 45);  break;  // 青
         case LedState::WifiReady:      color = _px->Color(50, 0, 50);  break;  // 紫
         case LedState::Idle:           color = _px->Color(0, 45, 0);   break;  // 绿
         case LedState::Recording:      color = _px->Color(70, 0, 0);   break;  // 红

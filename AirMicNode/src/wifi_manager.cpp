@@ -1,13 +1,13 @@
 #include "wifi_manager.h"
 
-void WifiManager::begin() {
+void WifiManager::begin(const airmic::WifiCredentials& creds) {
     WiFi.mode(WIFI_STA);
-    WiFi.persistent(false);      // 不把凭据写进 NVS，方便换网络
+    WiFi.persistent(false);      // 不把凭据写进 NVS，NVS 由 CredentialStore 自己管
     WiFi.setAutoReconnect(true);
     WiFi.setSleep(true);         // 待机省电
-    WiFi.begin(WIFI_SSID, WIFI_PASS);
+    WiFi.begin(creds.ssid.c_str(), creds.pass.c_str());
     _lastAttempt = millis();
-    Serial.printf("[WiFi] 连接 SSID=%s ...\n", WIFI_SSID);
+    Serial.printf("[WiFi] 连接 SSID=%s ...\n", creds.ssid.c_str());
 }
 
 bool WifiManager::poll() {
