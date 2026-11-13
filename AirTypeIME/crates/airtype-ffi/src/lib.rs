@@ -12,7 +12,7 @@ use std::ffi::{c_char, c_void, CStr, CString};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use airtype_core::Config;
-use airtype_daemon::{run_server, TextCallback};
+use airtype_daemon::{run_server, Registry, TextCallback};
 
 const AIRTYPE_OK: i32 = 0;
 const AIRTYPE_ERR_CONFIG: i32 = -2;
@@ -140,7 +140,7 @@ pub extern "C" fn airtype_start() -> i32 {
 
     let (tx, rx) = tokio::sync::oneshot::channel::<()>();
     g.runtime.as_ref().unwrap().spawn(async move {
-        if let Err(e) = run_server(config, on_text, rx).await {
+        if let Err(e) = run_server(config, Arc::new(Registry::new()), on_text, rx).await {
             tracing::error!("AirTypeIME server stopped: {e:#}");
         }
     });

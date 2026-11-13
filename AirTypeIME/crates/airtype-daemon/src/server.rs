@@ -17,6 +17,7 @@ use airtype_core::{Config, Frame, FrameKind, Pipeline, PipelineEvent, Timings};
 
 use crate::engines;
 use crate::inject::{build_injector, TextInjector};
+use crate::registry::Registry;
 use crate::TextCallback;
 
 type WsSink = futures_util::stream::SplitSink<WebSocketStream<TcpStream>, Message>;
@@ -49,11 +50,14 @@ struct ServerState {
     streaming: Option<Arc<dyn StreamingAsr>>,
     injector: Arc<dyn TextInjector>,
     on_text: TextCallback,
+    /// 设备状态快照，给设置页面用。
+    registry: Arc<Registry>,
 }
 
 /// 启动服务，直到 `shutdown` 被触发。非阻塞于调用者之外（本身是 async）。
 pub async fn run_server(
     config: Config,
+    registry: Arc<Registry>,
     on_text: TextCallback,
     mut shutdown: oneshot::Receiver<()>,
 ) -> anyhow::Result<()> {
@@ -88,6 +92,7 @@ pub async fn run_server(
         streaming: engines.streaming,
         injector,
         on_text,
+        registry,
     });
 
     loop {
@@ -126,6 +131,9 @@ async fn handle_connection(
     ));
     let mut trace = StreamTrace::default();
     tracing::info!(%peer, "AirMic 已连接");
+    // 先登记连接（此时还不知道 device 名），START 帧到达时再补名字。
+    let peer_key = peer.to_string();
+    state.registry.on_connected(&peer_key);
     send(&mut sink, Frame::status(0, "ready", "", "")).await?;
 
     while let Some(msg) = source.next().await {
@@ -161,7 +169,17 @@ async fn handle_connection(
 
                 match outcome {
                     Ok((event, timing)) => {
-                        dispatch(event, timing, end_at, &mut trace, &state, &mut sink, seq).await?
+                        dispatch(
+                            event,
+                            timing,
+                            end_at,
+                            &mut trace,
+                            &state,
+                            &peer_key,
+                            &mut sink,
+                            seq,
+                        )
+                        .await?
                     }
                     Err(e) => {
                         tracing::warn!(%peer, error = %e, "帧处理失败");
@@ -179,6 +197,7 @@ async fn handle_connection(
         .lock()
         .map(|p| p.seq_warnings())
         .unwrap_or(0);
+    state.registry.on_disconnected(&peer_key);
     tracing::info!(%peer, seq_warnings, "AirMic 断开");
     Ok(())
 }
@@ -189,12 +208,14 @@ async fn dispatch(
     end_at: Option<Instant>,
     trace: &mut StreamTrace,
     state: &Arc<ServerState>,
+    peer: &str,
     sink: &mut WsSink,
     seq: u16,
 ) -> anyhow::Result<()> {
     match event {
         PipelineEvent::Started { device, sample_rate } => {
             tracing::info!(%device, %sample_rate, "PTT 开始");
+            state.registry.on_device(peer, &device);
             trace.on_started();
             send(sink, Frame::status(seq, "recognizing", "", "")).await?;
         }
@@ -223,6 +244,9 @@ async fn dispatch(
             metrics.total_ms = end_at
                 .map(|t| t.elapsed().as_millis() as u64)
                 .unwrap_or(0);
+            state
+                .registry
+                .on_utterance(peer, &text, trace.first_partial_ms, metrics.total_ms);
             tracing::info!(
                 asr_ms = metrics.asr_ms,
                 post_ms = metrics.post_ms,
@@ -294,6 +318,9 @@ async fn dispatch(
             metrics.total_ms = end_at
                 .map(|t| t.elapsed().as_millis() as u64)
                 .unwrap_or(0);
+            state
+                .registry
+                .on_utterance(peer, &text, trace.first_partial_ms, metrics.total_ms);
             tracing::info!(
                 asr_ms = metrics.asr_ms,
                 post_ms = metrics.post_ms,

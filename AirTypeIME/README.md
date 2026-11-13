@@ -11,7 +11,7 @@ AirType 的 PC 端：接收 AirMic Node 经 Wi-Fi WebSocket 送来的语音，�
 输入法必须被操作系统识别为「输入法」才能往别的进程里写文字，这一层每个平台都有强制的原生技术栈，绕不开。所以把**跨平台业务逻辑收敛到 Rust 一处**，把**平台特异性隔离在薄外壳里**。
 
 ```text
-[AirMic Node / ESP32-S3 Mini]  ──Wi-Fi WebSocket / 裸 PCM 16k16bit──┐
+[AirMic Node / ESP32-S3 SuperMini]  ──Wi-Fi WebSocket / 裸 PCM 16k16bit──┐
                                                                    ▼
 ┌──────────────────────────── AirTypeIME ──────────────────────────────────┐
 │  airtype-daemon          WebSocket 服务 / 会话编排 / 注入（平台 I/O）     │
@@ -60,7 +60,8 @@ AirTypeIME/
 │   ├── airtype-asr-sherpa/          # 内嵌 sherpa-onnx 引擎（静态链接 onnxruntime）
 │   │   └── src/lib.rs
 │   ├── airtype-daemon/              # WebSocket 服务 + 引擎装配 + 注入 + 延迟埋点
-│   │   └── src/{lib,engines,server,inject,main}.rs
+│   │   └── src/{lib,engines,server,inject,registry,web,main}.rs
+│   │       # web_page.js 由 web.rs 用 include_str! 内嵌进页面
 │   └── airtype-ffi/                 # cdylib，导出 C ABI
 ├── platforms/windows/tsf/
 │   ├── include/airtype_ffi.h        # 原生外壳用的头文件
@@ -116,6 +117,18 @@ END
 
 daemon 侧同时会出现 `最终文本: ...` 与 `[INJECT:none] ...`。
 
+### 设置页面
+
+daemon 启动后会额外开一个本机 HTTP 服务（默认 `http://127.0.0.1:8766/`），可以：
+
+- 看当前配置、运行时长、每个 AirMic 的连接状态与识别统计（3 秒轮询 `/api/state`）；
+- 用表单改配置并写回 `airtype.toml`，或整份粘贴 TOML（保存前先解析校验，语法错误不覆盖现有配置）；
+- 改动**重启 daemon 后生效**，当前连接与正在进行的识别不受影响。
+
+四个接口：`GET /`、`GET /api/state`、`POST /api/config`、`POST /api/raw`。服务是手写的最小 HTTP/1.1（`web.rs`），没有引入 axum / tiny_http 之类依赖。
+
+> **安全边界**：默认只监听 `127.0.0.1`。这个页面能改写 ASR 与注入配置，把 `bind` 改成 `0.0.0.0` 前请先确认网络可信。
+
 ### 让文字真的进输入框
 
 默认 `inject.mode = "none"`（只写日志，不碰系统剪贴板）——这样无头验证不会误改你正在编辑的窗口。要真实注入，改配置：
@@ -155,6 +168,7 @@ bind = "0.0.0.0"   # 默认 127.0.0.1 只接受本机
 | `streaming` | `enabled` / `chunk_ms` / `replace` | `false` / `200` / `true` | 内嵌 sherpa 下 `enabled=true` 即开流式实时上屏 |
 | `postprocess` | 4 个开关 | 全 `true` | 口头词 / 全角数字 / 末尾标点 / 空白 |
 | `inject` | `mode` | `none` | `none` \| `clipboard_paste` |
+| `web` | `enabled` / `bind` / `port` | `true` / `127.0.0.1` / `8766` | 内置设置页面；`bind` 保持本机，改 `0.0.0.0` 会暴露给同局域网 |
 
 日志级别用环境变量控制：`RUST_LOG=debug cargo run -p airtype-daemon`。
 
@@ -316,7 +330,7 @@ airtype_stop();
 
 FFI 启动时**强制把内置注入设为 `none`**，由外壳负责写入，避免重复输入。详见 [`platforms/windows/tsf/README.md`](platforms/windows/tsf/README.md)。
 
-> Tauri / Electron 只适合做设置界面，不能作为输入法本体。设置 UI 后续可独立做一个共享的前端，通过本地 IPC 读写 `airtype.toml`。
+> Tauri / Electron 只适合做设置界面，不能作为输入法本体。内置的 `web.rs` 已经承担了设置页（改配置 + 看设备状态）；后续若要更重的 UI，可另做一个共享前端，走同一份 `airtype.toml` 与 `/api/*` 接口。
 
 ---
 
@@ -330,6 +344,6 @@ FFI 启动时**强制把内置注入设为 `none`**，由外壳负责写入，�
 - 流式模型无标点、英文按大写字母分词输出（transducer 特性）；`postprocess` 只在收尾补句末标点，partial 阶段刻意不补，避免标点闪烁。
 - ASR 已内嵌 sherpa-onnx（Rust，零 Python），但只支持 zipformer transducer 一种模型结构；换 SenseVoice / paraformer 需要给 `airtype-asr-sherpa` 加配置变体。
 - 6.4 的延迟是**本地回环 + 已生成的 WAV**，不含 Wi-Fi 传输、INMP441 采集与按键物理延迟，这些必须上电实测。
-- 设置界面、多设备管理、配网、电池/LED 状态回传都还没做。
+- 设置页面与设备注册表已可用（见 §3「设置页面」），但只记录**本机**连接状态：不做多设备切换/选路，也不把状态回传给 AirMic（电池、LED 等仍只在固件本地）。
 
 许可：MIT（沿用仓库根 `LICENSE`）。

@@ -2,7 +2,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use airtype_core::Config;
-use airtype_daemon::{run_server, TextCallback};
+use airtype_daemon::{run_server, run_web, Registry, TextCallback};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -48,7 +48,26 @@ async fn main() -> anyhow::Result<()> {
     );
     println!("按 Ctrl+C 退出。用 tools/mock_airmic.py 模拟 AirMic 推流。");
 
-    run_server(config, on_text, stop_rx).await
+    // WebSocket 服务与设置页面共用同一份注册表，页面才能看到实时设备状态。
+    let registry = Arc::new(Registry::new());
+    if config.web.enabled {
+        let web_config = config.clone();
+        let web_path = config_path.clone();
+        let web_registry = registry.clone();
+        tokio::spawn(async move {
+            if let Err(e) = run_web(web_config, web_path, web_registry).await {
+                tracing::error!("设置页面停止: {e:#}");
+            }
+        });
+        println!(
+            "设置页面: http://{}:{}/（仅本机可访问；改 bind 前先读 [web] 段的说明）",
+            config.web.bind, config.web.port
+        );
+    } else {
+        tracing::info!("[web] enabled = false，跳过设置页面");
+    }
+
+    run_server(config, registry, on_text, stop_rx).await
 }
 
 /// 给 anyhow 的 Context 加一条带路径的说明，避免污染主流程。

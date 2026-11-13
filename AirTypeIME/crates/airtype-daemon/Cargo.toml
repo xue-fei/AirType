@@ -16,6 +16,7 @@ path = "src/main.rs"
 [dependencies]
 airtype-core = { workspace = true }
 airtype-asr-sherpa = { workspace = true }
+serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
