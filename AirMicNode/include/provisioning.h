@@ -8,7 +8,8 @@
 // 进入后：
 //   1. 开 AirMic-XXXXXX 开放热点（192.168.4.1）
 //   2. WebServer 提供 GET /（表单 + 附近热点列表）、POST /save、GET /rescan
-//   3. 同时监听串口：一行 "SSID:密码" 或 JSON {"ssid":"..","pass":".."}
+//   3. 同时监听串口：一行 "SSID:密码" 或 JSON
+//      {"ssid":"..","pass":".."[,"host":"..","port":..]}
 //   4. 保存成功后返回 Saved，由调用方重启；超时返回 Timeout
 //
 // 安全说明：AP 不加密（本机没有屏幕，无法展示随机密码），配网热点只在
@@ -40,8 +41,11 @@ private:
     void handleSave();
     void handleRescan();
     void handleNotFound();
-    String renderPage(const char* message, bool isError) const;
+    String renderPage(const char* message, bool isError,
+                      const String& host, const String& port) const;
     void refreshScan();
+    /// 读 NVS 里已配的 PC 地址；没配过用编译期默认，供表单预填。
+    void loadTarget(String* host, uint16_t* port) const;
     String htmlEscape(const String& in) const;
 
     WebServer    _server{80};

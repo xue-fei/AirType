@@ -5,7 +5,12 @@
 namespace {
 
 const char* const SERIAL_USAGE =
-    "SSID:密码  或  {\"ssid\":\"..\",\"pass\":\"..\"}";
+    "SSID:密码  或  {\"ssid\":\"..\",\"pass\":\"..\"}"
+    "（JSON 可加 \"host\":\"..\",\"port\":..）";
+
+String portToString(uint16_t port) {
+    return String(static_cast<unsigned>(port));
+}
 
 }  // namespace
 
@@ -28,7 +33,10 @@ Provisioning::Result Provisioning::run(const String& apName, StatusLed& led) {
         while (Serial.available() > 0) {
             airmic::WifiCredentials c;
             if (serialFeed(static_cast<uint8_t>(Serial.read()), &c)) {
-                Serial.printf("[配网] 串口收到 SSID=%s\n", c.ssid.c_str());
+                Serial.printf("[配网] 串口收到 SSID=%s host=%s port=%u\n",
+                              c.ssid.c_str(),
+                              c.hasHostPort() ? c.host.c_str() : "(默认)",
+                              static_cast<unsigned>(c.port));
                 if (CredentialStore::save(c)) {
                     Serial.println("[配网] 已写入 NVS，重启...");
                     _saved = true;
@@ -113,32 +121,76 @@ void Provisioning::setupRoutes() {
 }
 
 void Provisioning::handleRoot() {
-    _server.send(200, "text/html; charset=utf-8", renderPage(nullptr, false));
+    String host;
+    uint16_t port = 0;
+    loadTarget(&host, &port);
+    _server.send(200, "text/html; charset=utf-8",
+                 renderPage(nullptr, false, host, portToString(port)));
 }
 
 void Provisioning::handleSave() {
     // 注意：WebServer::arg() 已经做过 URL 解码（'+' -> 空格、%XX -> 字节），
     // 这里不要再调 airmic::urlDecode，否则会二次解码。
+    const String hostArg = _server.arg("host");
+    const String portArg = _server.arg("port");
+
     airmic::WifiCredentials c;
     c.ssid = _server.arg("ssid").c_str();
     c.pass = _server.arg("pass").c_str();
+    c.host = hostArg.c_str();
+
+    uint16_t port = 0;
+    if (!airmic::parsePortText(portArg.c_str(), &port)) {
+        _server.send(400, "text/html; charset=utf-8",
+                    renderPage("端口必须是 1–65535 的数字，或留空用默认端口。",
+                               true, hostArg, portArg));
+        return;
+    }
+    c.port = port;
 
     if (!c.valid()) {
         _server.send(400, "text/html; charset=utf-8",
                     renderPage("SSID 为空或超长（SSID ≤ 32 字节，密码 ≤ 63 字节）。",
-                               true));
+                               true, hostArg, portArg));
+        return;
+    }
+    // host/port 必须成对：只填一个会让设备连到半个地址上
+    if (!c.hostPortValid()) {
+        _server.send(400, "text/html; charset=utf-8",
+                    renderPage("PC 地址与端口必须成对填写（或都留空用编译期默认）。",
+                               true, hostArg, portArg));
         return;
     }
     if (!CredentialStore::save(c)) {
         _server.send(500, "text/html; charset=utf-8",
-                    renderPage("写入 NVS 失败，请重试。", true));
+                    renderPage("写入 NVS 失败，请重试。", true, hostArg, portArg));
         return;
     }
 
-    Serial.printf("[配网] 网页提交 SSID=%s，已保存\n", c.ssid.c_str());
+    Serial.printf("[配网] 网页提交 SSID=%s，PC=%s:%u，已保存\n",
+                  c.ssid.c_str(),
+                  c.hasHostPort() ? c.host.c_str() : AIRTYPE_HOST,
+                  static_cast<unsigned>(c.hasHostPort() ? c.port
+                                                        : AIRTYPE_PORT));
     _saved = true;
     _server.send(200, "text/html; charset=utf-8",
-                renderPage("已保存，设备正在重启…", false));
+                renderPage("已保存，设备正在重启…", false, hostArg, portArg));
+}
+
+void Provisioning::loadTarget(String* host, uint16_t* port) const {
+    if (host == nullptr || port == nullptr) {
+        return;
+    }
+    // 只在 NVS 里确实配过地址时才回填；没配过留空，让 secrets.h 继续兜底
+    // （否则一保存就把编译期默认冻结进 NVS，以后改 secrets.h 也不生效）。
+    airmic::WifiCredentials c;
+    if (CredentialStore::load(&c) && c.hasHostPort()) {
+        *host = c.host.c_str();
+        *port = c.port;
+    } else {
+        *host = "";
+        *port = 0;
+    }
 }
 
 void Provisioning::handleRescan() {
@@ -198,7 +250,8 @@ String Provisioning::htmlEscape(const String& in) const {
     return out;
 }
 
-String Provisioning::renderPage(const char* message, bool isError) const {
+String Provisioning::renderPage(const char* message, bool isError,
+                                const String& host, const String& port) const {
     String html;
     html += F("<!DOCTYPE html><html lang=\"zh-CN\"><head><meta charset=\"utf-8\">"
               "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
@@ -238,8 +291,8 @@ String Provisioning::renderPage(const char* message, bool isError) const {
               "</style></head><body><main>");
     html += F("<h1>AirMic 配网</h1>");
     html += F("<p class=\"tip\">选择 Wi-Fi 并填写密码，保存后设备自动重启并接入 "
-              "AirTypeIME。<br>也可以直接用串口发 <code>SSID:密码</code>。</p>");
-
+              "AirTypeIME。换了 PC 就连带把「PC 端地址」改成新机器的 IP。"
+              "<br>也可以直接用串口发 <code>SSID:密码</code>。</p>");
     if (message != nullptr) {
         html += F("<div class=\"msg ");
         html += isError ? F("err") : F("ok");
@@ -262,6 +315,21 @@ String Provisioning::renderPage(const char* message, bool isError) const {
               "<label for=\"pass\">Wi-Fi 密码</label>"
               "<input id=\"pass\" name=\"pass\" type=\"password\" maxlength=\"63\" "
               "autocomplete=\"off\" placeholder=\"开放网络可留空\">"
+              "<label for=\"host\">PC 端地址（AirTypeIME 所在机器）</label>"
+              "<input id=\"host\" name=\"host\" maxlength=\"64\" "
+              "autocomplete=\"off\" placeholder=\"留空 = 用编译期默认 ");
+    html += AIRTYPE_HOST;  // 编译期常量，非用户输入
+    html += F("\" value=\"");
+    html += htmlEscape(host);
+    html += F("\">"
+              "<label for=\"port\">端口</label>"
+              "<input id=\"port\" name=\"port\" maxlength=\"5\" "
+              "inputmode=\"numeric\" autocomplete=\"off\" "
+              "placeholder=\"留空 = 用默认 ");
+    html += portToString(static_cast<uint16_t>(AIRTYPE_PORT));
+    html += F("\" value=\"");
+    html += htmlEscape(port);
+    html += F("\">"
               "<button type=\"submit\">保存并重启</button>"
               "</form>");
 
