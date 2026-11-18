@@ -1,9 +1,10 @@
 #pragma once
 // NVS 凭据存储：基于 ESP32 核心的 Preferences（ESP-IDF NVS 的键值封装）。
 //
-// 只存 Wi-Fi 凭据；AIRTYPE_HOST/PORT 仍是编译期常量（secrets.h）。
+// 存 Wi-Fi 凭据，以及可选的 PC 端地址（host/port，见 WifiCredentials）。
 // 存储格式就是 airmic::formatJsonCredentials 产出的 JSON，
-// 因此以后要加 host/port 字段时，旧数据依然能解析（未知字段被忽略）。
+// 因此以后要加字段时，旧数据依然能解析（未知字段被忽略）。
+// host/port 缺省 = 用 airmic_config.h / secrets.h 里的编译期默认。
 //
 // 用法：
 //   airmic::WifiCredentials c;

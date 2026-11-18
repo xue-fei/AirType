@@ -2,6 +2,10 @@
 // AirMic Node 集中配置：所有引脚、时序与网络参数都在这里改。
 // Wi-Fi 与 PC 地址建议写在 include/secrets.h（已 gitignore），不要提交到仓库。
 
+#include <string>
+
+#include "wifi_credentials.h"
+
 #if defined(__has_include)
 #  if __has_include("secrets.h")
 #    include "secrets.h"
@@ -24,6 +28,17 @@
 #ifndef AIRTYPE_PATH
 #  define AIRTYPE_PATH "/ws"
 #endif
+
+// ---- PC 端地址：NVS 优先，编译期默认兜底 --------------------------------
+// 配网页面 / 串口 JSON 配过的 host/port 存在 NVS（airmic::WifiCredentials）；
+// 没配过（hasHostPort() == false）就退回这里的编译期默认。
+// 换 PC 时只需重新配网，不用改代码重刷固件。
+inline std::string airmicEffectiveHost(const airmic::WifiCredentials& c) {
+    return c.hasHostPort() ? c.host : std::string(AIRTYPE_HOST);
+}
+inline uint16_t airmicEffectivePort(const airmic::WifiCredentials& c) {
+    return c.hasHostPort() ? c.port : static_cast<uint16_t>(AIRTYPE_PORT);
+}
 
 // ---- 配网（SoftAP）----------------------------------------------------
 // 触发条件（见 main.cpp）：NVS 里没存过凭据且 secrets.h 也没填 SSID，

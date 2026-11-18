@@ -6,12 +6,14 @@
 
 #include "airmic_config.h"
 #include "protocol.h"
+#include "wifi_credentials.h"
 
 using ServerFrameCallback = void (*)(const airmic::ParsedFrame& frame, void* ctx);
 
 class NetClient {
 public:
-    void begin();
+    /// 用凭据里配过的地址（缺省退回编译期 AIRTYPE_HOST/PORT）建立连接。
+    void begin(const airmic::WifiCredentials& creds);
     void restart();
     void loop() { _ws.loop(); }
     bool connected() const { return _connected; }
@@ -27,6 +29,8 @@ private:
     void handleEvent(WStype_t type, uint8_t* payload, size_t length);
 
     WebSocketsClient      _ws;
+    std::string           _host;
+    uint16_t              _port = 0;
     volatile bool         _connected = false;
     ServerFrameCallback   _cb  = nullptr;
     void*                 _ctx = nullptr;

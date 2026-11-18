@@ -335,10 +335,13 @@ void setup() {
     g_deviceId = makeDeviceId();
 
     net.onServerFrame(onServerFrame, nullptr);
-    net.begin();
+    net.begin(creds);  // 地址优先取 NVS 里配过的，缺省用编译期 AIRTYPE_HOST/PORT
 
     g_bootUntilMs = millis() + 1000;
     Serial.printf("设备 ID: %s\n", g_deviceId.c_str());
+    Serial.printf("PC 端: %s:%u（%s）\n", airmicEffectiveHost(creds).c_str(),
+                  static_cast<unsigned>(airmicEffectivePort(creds)),
+                  creds.hasHostPort() ? "NVS 配置" : "编译期默认");
     Serial.printf("音频: %luHz / 16bit / mono / %ums 一帧 (%uB PCM)\n",
                   static_cast<unsigned long>(SAMPLE_RATE),
                   FRAME_MS,

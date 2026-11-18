@@ -7,13 +7,16 @@ uint8_t g_frameBuf[airmic::HEADER_LEN + airmic::MAX_PAYLOAD];
 
 NetClient* NetClient::s_self = nullptr;
 
-void NetClient::begin() {
+void NetClient::begin(const airmic::WifiCredentials& creds) {
     s_self = this;
+    _host  = airmicEffectiveHost(creds);
+    _port  = airmicEffectivePort(creds);
     _ws.onEvent(eventEntry);
     _ws.setReconnectInterval(WS_RECONNECT_MS);
-    _ws.begin(AIRTYPE_HOST, AIRTYPE_PORT, AIRTYPE_PATH);
-    Serial.printf("[WS] 目标 ws://%s:%d%s（自动重连 %lums）\n",
-                  AIRTYPE_HOST, AIRTYPE_PORT, AIRTYPE_PATH,
+    _ws.begin(_host.c_str(), _port, AIRTYPE_PATH);
+    Serial.printf("[WS] 目标 ws://%s:%u%s（%s，自动重连 %lums）\n",
+                  _host.c_str(), _port, AIRTYPE_PATH,
+                  creds.hasHostPort() ? "NVS 配置" : "编译期默认",
                   static_cast<unsigned long>(WS_RECONNECT_MS));
 }
 
@@ -21,7 +24,7 @@ void NetClient::restart() {
     _connected = false;
     _ws.disconnect();
     // Wi-Fi 刚恢复时重建 TCP 状态，比等库自己的重连定时器更快。
-    _ws.begin(AIRTYPE_HOST, AIRTYPE_PORT, AIRTYPE_PATH);
+    _ws.begin(_host.c_str(), _port, AIRTYPE_PATH);
 }
 
 bool NetClient::send(uint8_t kind, uint16_t seq,
