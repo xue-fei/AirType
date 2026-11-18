@@ -144,6 +144,113 @@ void test_json_round_trip() {
     TEST_ASSERT_EQUAL_STRING(in.pass.c_str(), out.pass.c_str());
 }
 
+void test_json_host_port_basic() {
+    WifiCredentials c;
+    TEST_ASSERT_TRUE(parseJsonCredentials(
+        "{\"ssid\":\"S\",\"pass\":\"p\",\"host\":\"192.168.2.177\",\"port\":8765}",
+        &c));
+    TEST_ASSERT_EQUAL_STRING("192.168.2.177", c.host.c_str());
+    TEST_ASSERT_EQUAL_UINT16(8765, c.port);
+    TEST_ASSERT_TRUE(c.hasHostPort());
+    TEST_ASSERT_TRUE(c.hostPortValid());
+}
+
+void test_json_port_as_string() {
+    WifiCredentials c;
+    TEST_ASSERT_TRUE(parseJsonCredentials(
+        "{\"ssid\":\"S\",\"host\":\"pc.local\",\"port\":\"9000\"}", &c));
+    TEST_ASSERT_EQUAL_STRING("pc.local", c.host.c_str());
+    TEST_ASSERT_EQUAL_UINT16(9000, c.port);
+}
+
+void test_json_host_port_must_come_in_pair() {
+    WifiCredentials c;
+    // 只填 host 或只填 port 都是半成品地址，直接拒
+    TEST_ASSERT_FALSE(parseJsonCredentials(
+        "{\"ssid\":\"S\",\"host\":\"192.168.2.177\"}", &c));
+    TEST_ASSERT_FALSE(parseJsonCredentials(
+        "{\"ssid\":\"S\",\"port\":8765}", &c));
+}
+
+void test_json_host_port_range_and_charset() {
+    WifiCredentials c;
+    TEST_ASSERT_FALSE(parseJsonCredentials(
+        "{\"ssid\":\"S\",\"host\":\"h\",\"port\":0}", &c));
+    TEST_ASSERT_FALSE(parseJsonCredentials(
+        "{\"ssid\":\"S\",\"host\":\"h\",\"port\":65536}", &c));
+    TEST_ASSERT_FALSE(parseJsonCredentials(
+        "{\"ssid\":\"S\",\"host\":\"h\",\"port\":-1}", &c));
+    // 端口写进 host、空格、URL 元字符都要挡住，否则会拼坏 ws://host:port/
+    TEST_ASSERT_FALSE(parseJsonCredentials(
+        "{\"ssid\":\"S\",\"host\":\"192.168.2.177:8080\",\"port\":80}", &c));
+    TEST_ASSERT_FALSE(parseJsonCredentials(
+        "{\"ssid\":\"S\",\"host\":\"bad host\",\"port\":80}", &c));
+    TEST_ASSERT_FALSE(parseJsonCredentials(
+        "{\"ssid\":\"S\",\"host\":\"ws://x\",\"port\":80}", &c));
+    // 边界值：65535 仍合法
+    TEST_ASSERT_TRUE(parseJsonCredentials(
+        "{\"ssid\":\"S\",\"host\":\"h\",\"port\":65535}", &c));
+}
+
+void test_json_without_host_port_still_parses() {
+    // 配网功能上线前存的旧数据必须继续可用（host 空、port 0 = 用编译期默认）
+    WifiCredentials c;
+    TEST_ASSERT_TRUE(parseJsonCredentials("{\"ssid\":\"S\",\"pass\":\"p\"}", &c));
+    TEST_ASSERT_EQUAL_STRING("", c.host.c_str());
+    TEST_ASSERT_EQUAL_UINT16(0, c.port);
+    TEST_ASSERT_FALSE(c.hasHostPort());
+    TEST_ASSERT_TRUE(c.hostPortValid());
+}
+
+void test_json_host_port_round_trip() {
+    WifiCredentials in;
+    in.ssid = "My \"WiFi\"";
+    in.pass = "p\\a";
+    in.host = "192.168.2.177";
+    in.port = 8765;
+    const std::string json = formatJsonCredentials(in);
+
+    WifiCredentials out;
+    TEST_ASSERT_TRUE(parseJsonCredentials(json, &out));
+    TEST_ASSERT_EQUAL_STRING(in.host.c_str(), out.host.c_str());
+    TEST_ASSERT_EQUAL_UINT16(in.port, out.port);
+}
+
+void test_json_host_port_not_emitted_when_unset() {
+    // 没配过就不输出这两个字段，保持与旧数据一致的存储格式
+    WifiCredentials in;
+    in.ssid = "S";
+    in.pass = "p";
+    TEST_ASSERT_EQUAL_STRING("{\"ssid\":\"S\",\"pass\":\"p\"}",
+                             formatJsonCredentials(in).c_str());
+}
+
+void test_port_text_parse() {
+    uint16_t p = 999;
+    // 空 / 空白 = 未指定（用编译期默认）
+    TEST_ASSERT_TRUE(airmic::parsePortText("", &p));
+    TEST_ASSERT_EQUAL_UINT16(0, p);
+    TEST_ASSERT_TRUE(airmic::parsePortText("   ", &p));
+    TEST_ASSERT_EQUAL_UINT16(0, p);
+
+    TEST_ASSERT_TRUE(airmic::parsePortText("8765", &p));
+    TEST_ASSERT_EQUAL_UINT16(8765, p);
+    TEST_ASSERT_TRUE(airmic::parsePortText(" 8765 ", &p));
+    TEST_ASSERT_EQUAL_UINT16(8765, p);
+    TEST_ASSERT_TRUE(airmic::parsePortText("1", &p));
+    TEST_ASSERT_EQUAL_UINT16(1, p);
+    TEST_ASSERT_TRUE(airmic::parsePortText("65535", &p));
+    TEST_ASSERT_EQUAL_UINT16(65535, p);
+
+    TEST_ASSERT_FALSE(airmic::parsePortText("0", &p));
+    TEST_ASSERT_FALSE(airmic::parsePortText("65536", &p));
+    TEST_ASSERT_FALSE(airmic::parsePortText("-1", &p));
+    TEST_ASSERT_FALSE(airmic::parsePortText("+80", &p));
+    TEST_ASSERT_FALSE(airmic::parsePortText("80a", &p));
+    TEST_ASSERT_FALSE(airmic::parsePortText("80 80", &p));
+    TEST_ASSERT_FALSE(airmic::parsePortText("999999", &p));
+}
+
 void test_url_decode() {
     TEST_ASSERT_EQUAL_STRING("hello world", urlDecode("hello+world").c_str());
     TEST_ASSERT_EQUAL_STRING("p@ss:w/rd", urlDecode("p%40ss%3Aw%2Frd").c_str());
@@ -169,6 +276,14 @@ int main(int, char**) {
     RUN_TEST(test_json_unicode_escape);
     RUN_TEST(test_json_rejects_bad_input);
     RUN_TEST(test_json_round_trip);
+    RUN_TEST(test_json_host_port_basic);
+    RUN_TEST(test_json_port_as_string);
+    RUN_TEST(test_json_host_port_must_come_in_pair);
+    RUN_TEST(test_json_host_port_range_and_charset);
+    RUN_TEST(test_json_without_host_port_still_parses);
+    RUN_TEST(test_json_host_port_round_trip);
+    RUN_TEST(test_json_host_port_not_emitted_when_unset);
+    RUN_TEST(test_port_text_parse);
     RUN_TEST(test_url_decode);
     return UNITY_END();
 }

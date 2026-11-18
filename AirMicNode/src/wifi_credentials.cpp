@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <cstdio>
+#include <cstdlib>
 
 namespace airmic {
 namespace {
@@ -169,6 +170,62 @@ int extractJsonString(const std::string& text, const char* key,
     }
 }
 
+/// 在 text 里找 "key" 对应的整数（数字字面量或字符串形式都接受）。
+/// 找不到返回 JSON_NOT_FOUND；结构对但不是合法整数返回 JSON_MALFORMED。
+int extractJsonNumber(const std::string& text, const char* key, long* out) {
+    const std::string needle = std::string("\"") + key + "\"";
+    size_t from = 0;
+    while (true) {
+        const size_t p = text.find(needle, from);
+        if (p == std::string::npos) {
+            return JSON_NOT_FOUND;
+        }
+        size_t q = p + needle.size();
+        while (q < text.size() && isSpace(text[q])) {
+            ++q;
+        }
+        if (q >= text.size() || text[q] != ':') {
+            from = p + needle.size();  // 误命中，继续找
+            continue;
+        }
+        ++q;
+        while (q < text.size() && isSpace(text[q])) {
+            ++q;
+        }
+        if (q >= text.size()) {
+            return JSON_MALFORMED;
+        }
+
+        std::string numStr;
+        if (text[q] == '"') {
+            if (!parseJsonString(text, q, &numStr)) {
+                return JSON_MALFORMED;
+            }
+        } else {
+            size_t r = q;
+            if (text[r] == '-' || text[r] == '+') {
+                ++r;
+            }
+            const size_t digitsStart = r;
+            while (r < text.size() && text[r] >= '0' && text[r] <= '9') {
+                ++r;
+            }
+            if (r == digitsStart) {
+                return JSON_MALFORMED;
+            }
+            numStr = text.substr(q, r - q);
+        }
+
+        char* end = nullptr;
+        const long v = std::strtol(numStr.c_str(), &end, 10);
+        if (end == nullptr || *end != '\0') {
+            return JSON_MALFORMED;
+        }
+        *out = v;
+        return JSON_OK;
+    }
+}
+
 void escapeJsonString(const std::string& in, std::string* out) {
     out->push_back('"');
     for (size_t i = 0; i < in.size(); ++i) {
@@ -251,10 +308,28 @@ bool parseJsonCredentials(const std::string& text, WifiCredentials* out) {
         }
     }
 
+    // host / port 可选，但必须成对出现（hostPortValid 会校验字符集与范围）
+    std::string host;
+    if (extractJsonString(text, "host", &host) == JSON_MALFORMED) {
+        return false;
+    }
+    long portNum = 0;
+    const int portResult = extractJsonNumber(text, "port", &portNum);
+    if (portResult == JSON_MALFORMED) {
+        return false;
+    }
+
     WifiCredentials c;
     c.ssid = ssid;
     c.pass = pass;
-    if (!c.valid()) {
+    c.host = host;
+    if (portResult == JSON_OK) {
+        if (portNum < AIRMIC_PORT_MIN || portNum > AIRMIC_PORT_MAX) {
+            return false;
+        }
+        c.port = static_cast<uint16_t>(portNum);
+    }
+    if (!c.valid() || !c.hostPortValid()) {
         return false;
     }
     *out = c;
@@ -270,8 +345,46 @@ std::string formatJsonCredentials(const WifiCredentials& c) {
     escapeJsonString(c.ssid, &json);
     json += ",\"pass\":";
     escapeJsonString(c.pass, &json);
+    // 没配过就不输出，保持与旧数据一致的格式
+    if (c.hasHostPort()) {
+        json += ",\"host\":";
+        escapeJsonString(c.host, &json);
+        char buf[24];
+        std::snprintf(buf, sizeof(buf), ",\"port\":%u",
+                      static_cast<unsigned>(c.port));
+        json += buf;
+    }
     json += "}";
     return json;
+}
+
+bool parsePortText(const std::string& text, uint16_t* out) {
+    if (out == nullptr) {
+        return false;
+    }
+    const std::string s = trim(text);
+    if (s.empty()) {
+        *out = 0;  // 未指定 = 用编译期默认
+        return true;
+    }
+    if (s.size() > 5) {  // 65535 最多 5 位
+        return false;
+    }
+    unsigned long v = 0;
+    for (size_t i = 0; i < s.size(); ++i) {
+        if (s[i] < '0' || s[i] > '9') {
+            return false;
+        }
+        v = v * 10 + static_cast<unsigned long>(s[i] - '0');
+        if (v > AIRMIC_PORT_MAX) {
+            return false;
+        }
+    }
+    if (v < AIRMIC_PORT_MIN) {
+        return false;
+    }
+    *out = static_cast<uint16_t>(v);
+    return true;
 }
 
 std::string urlDecode(const std::string& in) {
