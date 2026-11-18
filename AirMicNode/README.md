@@ -12,7 +12,7 @@ AirType 的硬件端：ESP32-S3 SuperMini + INMP441 数字麦克风 + PTT 按键
 | 音频传输 | 裸 PCM，WebSocket binary 帧，帧协议 v1（8 字节头） |
 | PTT | 消抖、按下即录、短按 `<250ms` 取消、松键触发识别 |
 | 状态灯 | 单色 GPIO 或板载 WS2812，非阻塞灯效区分 9 种状态 |
-| 配网 | SoftAP 热点 + 网页（`http://192.168.4.1/`）+ 串口回退，凭据存 NVS，换路由器不用重刷固件 |
+| 配网 | SoftAP 热点 + 网页（`http://192.168.4.1/`）+ 串口回退，Wi-Fi 与 PC 地址存 NVS，换路由器 / 换 PC 都不用重刷固件 |
 | 网络 | Wi-Fi STA 断线重连、WebSocket 自动重连、Wi-Fi 恢复后主动重建连接 |
 | 心跳 | 每 5s `PING`，服务端回 `PONG` |
 | 服务端消息 | 解析 `STATUS` / `TEXT`，串口打印识别结果 |
@@ -60,7 +60,13 @@ SSID:  AirMic-XXXXXX         （XXXXXX = 芯片 MAC 后 6 位）
 MyHomeWiFi:wifi-password
 ```
 
-或等价的 JSON：`{"ssid":"MyHomeWiFi","pass":"wifi-password"}`（`password` 也行，密码留空表示开放网络）。
+或等价的 JSON：`{"ssid":"MyHomeWiFi","pass":"wifi-password"}`（`password` 也行，密码留空表示开放网络）。要一并配 PC 端地址就加两个字段：
+
+```json
+{"ssid":"MyHomeWiFi","pass":"wifi-password","host":"192.168.2.177","port":8765}
+```
+
+`host` / `port` 必须成对出现（或都不写 = 用编译期默认），`host` 只接受字母、数字、`.`、`-`、`_`，端口 1–65535。
 
 **方式 B：编译期写死（调试用）**
 
@@ -70,9 +76,20 @@ cp include/secrets.h.example include/secrets.h
 
 编辑 `include/secrets.h`：填 `WIFI_SSID` / `WIFI_PASS`。**只在 NVS 里还没有已存凭据时生效**（配网成功后以 NVS 为准）。该文件已在 `.gitignore` 中。
 
-**重新配网**：已有凭据时，**开机 250ms 内按住 PTT** 会强制进入配网模式，用来换路由器或纠正错误凭据。配网模式等 5 分钟超时，超时后退回旧凭据（没有旧凭据就离线待机）。
+**重新配网**：已有凭据时，**开机 250ms 内按住 PTT** 会强制进入配网模式，用来换路由器、纠正错误凭据或改 PC 端地址。配网模式等 5 分钟超时，超时后退回旧凭据（没有旧凭据就离线待机）。
 
-两种方式都不影响 `AIRTYPE_HOST`——PC 端地址仍然来自 `secrets.h`，要改运行 AirTypeIME 的 PC 的局域网 IP。PC 端需要监听局域网，把 `AirTypeIME/config/airtype.toml` 改成：
+### PC 端地址（`host` / `port`）
+
+设备连哪个 PC 由优先级决定：
+
+| 优先级 | 来源 | 说明 |
+|---|---|---|
+| 1 | NVS（配网页面 / 串口 JSON） | 换 PC 时重新配网即可，**不用重刷固件** |
+| 2 | `secrets.h` 的 `AIRTYPE_HOST` / `AIRTYPE_PORT` | 编译期默认，仅作兜底 |
+
+配网页面的地址栏**只在 NVS 里已配过时回填**；没配过就留空，占位符显示编译期默认。留空保存不会把编译期默认写进 NVS，`secrets.h` 因此始终是兜底权威。串口 JSON 与网页表单等价。
+
+PC 端需要监听局域网，把 `AirTypeIME/config/airtype.toml` 改成：
 
 ```toml
 [server]
@@ -154,6 +171,8 @@ cd AirMicNode && python tools/verify_ime_bridge.py --host 127.0.0.1
 | `PROVISION_TIMEOUT_MS` | 300000 | 配网页面等待上限（5 分钟）|
 | `PTT_BOOT_HOLD_MS` | 250 | 开机按住 PTT 强制配网的窗口 |
 | `PROVISION_SCAN_MAX` | 12 | 配网页面最多列出多少个附近热点 |
+| `AIRTYPE_HOST` | `192.168.1.100` | PC 端地址**编译期默认**；NVS 里配过就以 NVS 为准 |
+| `AIRTYPE_PORT` | 8765 | PC 端端口**编译期默认**；同上 |
 
 ## 验证记录
 
@@ -161,9 +180,9 @@ cd AirMicNode && python tools/verify_ime_bridge.py --host 127.0.0.1
 
 | 项目 | 结果 |
 |---|---|
-| `pio run -e supermini` | **SUCCESS**；`firmware.bin` 897KB；RAM 15.4%（50484 / 327680 B）、Flash 70.1%（918617 / 1310720 B）；链接进 `sdk/esp32s3/qio_qspi/` 的 `spiram*.c.obj`，证明 quad PSRAM 已按 `qio` 编入 |
+| `pio run -e supermini` | **SUCCESS**，无编译警告；RAM 15.4%（50508 / 327680 B）、Flash 70.4%（922413 / 1310720 B）；`firmware.bin` 922784 B；链接进 `sdk/esp32s3/qio_qspi/` 的 `spiram*.c.obj`，证明 quad PSRAM 已按 `qio` 编入 |
 | `pio run -e esp32s3` | **SUCCESS**，无编译警告；`firmware.bin` 862KB；RAM 15.3%（50200 / 327680 B）、Flash 26.4%（882233 / 3342336 B） |
-| `pio test -e native` | **22 / 22 PASSED**（`test_protocol` 9 + `test_wifi_credentials` 13）：帧头字节布局与 Rust `protocol.rs` 的 `header_layout_is_stable` 逐字节对齐；凭据解析覆盖 `"SSID:PASS"`、JSON 转义 / `\uXXXX` 代理对、URL 解码与 32/63 字节边界 |
+| `pio test -e native` | **30 / 30 PASSED**（`test_protocol` 9 + `test_wifi_credentials` 21）：帧头字节布局与 Rust `protocol.rs` 的 `header_layout_is_stable` 逐字节对齐；凭据解析覆盖 `"SSID:PASS"`、JSON 转义 / `\uXXXX` 代理对、URL 解码、32/63 字节边界，以及 `host`/`port` 的成对校验、字符集与端口范围 |
 | `tools/verify_ime_bridge.py` 打真实 daemon | **3 / 3 PASS**：正常 PTT（含 u16 seq 回绕 + PING/PONG）、连续 seq 多段会话、短按取消；服务端均正常回 `done` + `TEXT` / `cancelled` 且无 `error` |
 
 工具链：PlatformIO Core 6.2.0 / espressif32 6.13.0 / Arduino-ESP32 2.0.17（IDF 4.4）/ WebSockets 2.7.3 / Adafruit NeoPixel 1.15.5。
@@ -175,7 +194,8 @@ cd AirMicNode && python tools/verify_ime_bridge.py --host 127.0.0.1
 ## 已知限制 / 下一步
 
 - **配网安全**：配网热点不加密（本机没有屏幕可展示随机密码），密码经明文 HTTP 提交，仅建议在家庭局域网内使用；配网完成即关闭热点。后续可加 DNS 强制门户（`/generate_204` 已做 302 跳转）与 HTTPS。
-- **PC 端地址不可配**：`AIRTYPE_HOST` / `AIRTYPE_PORT` 仍是编译期常量，换 PC 仍要改 `secrets.h` 重刷。`WifiCredentials` 的 JSON 结构已预留扩展位，加字段不影响旧数据解析。
+- **PC 端地址只支持 IPv4 / 域名**：`host` 字符集为字母、数字、`.`、`-`、`_`，不接受 IPv6 文字地址（含 `:`）；也不接受在地址里带端口或 scheme（端口单独填）。
+- **配网页面无认证**：热点与页面均无密码，任何能连上热点的人都能改这台设备的 Wi-Fi / PC 地址。仅建议在家庭局域网内使用。
 - **连续按键**：上一段识别结果尚未返回时（`Uploading`），新按键会被忽略，避免并发 ASR 与 seq 错乱。
 - **编码**：v1 裸 PCM 256kbps，与既有三端音频流系统一致；换 Opus / ADPCM 只需改 `START` 的 `codec` 与 PC 端 `audio.rs` 的解码层。
 - **电源管理**：只做了 modem sleep 与录音时高性能切换，未做轻休眠/按键唤醒（会断 Wi-Fi，需重连策略配合）。
