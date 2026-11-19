@@ -19,7 +19,6 @@
 #include <richedit.h>
 #include <uiautomation.h>
 
-
 #include <atlbase.h>
 #include <cstdio>
 #include <cstring>
@@ -246,6 +245,67 @@ void DoWindowWrite(HWND hwnd) {
     airtype::log("  [对照] SetWindowTextW 已写入 %zu 字符", text.size());
 }
 
+/// 把 32 位 BGRA 像素写成 BMP。
+bool WriteBmp(const wchar_t* path, int w, int h, const std::vector<BYTE>& pixels) {
+    BITMAPINFO bi{};
+    bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    bi.bmiHeader.biWidth = w;
+    bi.bmiHeader.biHeight = -h;  // 自顶向下
+    bi.bmiHeader.biPlanes = 1;
+    bi.bmiHeader.biBitCount = 32;
+    bi.bmiHeader.biCompression = BI_RGB;
+
+    BITMAPFILEHEADER fh{};
+    fh.bfType = 0x4D42;  // 'BM'
+    fh.bfOffBits = sizeof(BITMAPFILEHEADER) + sizeof(BITMAPINFOHEADER);
+    fh.bfSize = fh.bfOffBits + static_cast<DWORD>(pixels.size());
+
+    FILE* f = nullptr;
+    if (_wfopen_s(&f, path, L"wb") != 0 || f == nullptr) {
+        airtype::log("创建截图文件失败: %s", utf16_to_utf8(path).c_str());
+        return false;
+    }
+    fwrite(&fh, sizeof(fh), 1, f);
+    fwrite(&bi.bmiHeader, sizeof(bi.bmiHeader), 1, f);
+    fwrite(pixels.data(), 1, pixels.size(), f);
+    fclose(f);
+    return true;
+}
+
+/// 抓整块虚拟屏幕（含所有显示器），用于核对真实落字结果。
+bool SaveScreenBmp(const wchar_t* path) {
+    const int x = GetSystemMetrics(SM_XVIRTUALSCREEN);
+    const int y = GetSystemMetrics(SM_YVIRTUALSCREEN);
+    const int w = GetSystemMetrics(SM_CXVIRTUALSCREEN);
+    const int h = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+    if (w <= 0 || h <= 0) {
+        return false;
+    }
+    HDC screen = GetDC(nullptr);
+    HDC mem = CreateCompatibleDC(screen);
+    HBITMAP bmp = CreateCompatibleBitmap(screen, w, h);
+    HGDIOBJ old = SelectObject(mem, bmp);
+    BitBlt(mem, 0, 0, w, h, screen, x, y, SRCCOPY | CAPTUREBLT);
+
+    BITMAPINFO bi{};
+    bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    bi.bmiHeader.biWidth = w;
+    bi.bmiHeader.biHeight = -h;
+    bi.bmiHeader.biPlanes = 1;
+    bi.bmiHeader.biBitCount = 32;
+    bi.bmiHeader.biCompression = BI_RGB;
+    std::vector<BYTE> pixels(static_cast<size_t>(w) * h * 4);
+    const int got = GetDIBits(mem, bmp, 0, h, pixels.data(), &bi, DIB_RGB_COLORS);
+    DeleteObject(bmp);
+    DeleteDC(mem);
+    ReleaseDC(nullptr, screen);
+    if (got == 0) {
+        airtype::log("GetDIBits 失败");
+        return false;
+    }
+    return WriteBmp(path, w, h, pixels);
+}
+
 /// 把窗口内容抓成 BMP，用于肉眼核对写入结果。
 bool SaveWindowBmp(HWND hwnd, const wchar_t* path) {
     RECT rc{};
@@ -286,22 +346,9 @@ bool SaveWindowBmp(HWND hwnd, const wchar_t* path) {
         return false;
     }
 
-    BITMAPFILEHEADER fh{};
-    fh.bfType = 0x4D42;  // 'BM'
-    fh.bfOffBits = sizeof(BITMAPFILEHEADER) + sizeof(BITMAPINFOHEADER);
-    fh.bfSize = fh.bfOffBits + static_cast<DWORD>(pixels.size());
-
-    FILE* f = nullptr;
-    if (_wfopen_s(&f, path, L"wb") != 0 || f == nullptr) {
-        airtype::log("创建截图文件失败: %s", utf16_to_utf8(path).c_str());
-        return false;
-    }
-    fwrite(&fh, sizeof(fh), 1, f);
-    fwrite(&bi.bmiHeader, sizeof(bi.bmiHeader), 1, f);
-    fwrite(pixels.data(), 1, pixels.size(), f);
-    fclose(f);
+    const bool ok = WriteBmp(path, w, h, pixels);
     airtype::log("截图已保存: %s (PrintWindow=%d)", utf16_to_utf8(path).c_str(), printed);
-    return true;
+    return ok;
 }
 
 LRESULT CALLBACK ProbeWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
@@ -656,11 +703,265 @@ int RunDllSelfTest(const std::wstring& dll_path) {
     return ok ? 0 : 1;
 }
 
+// ---------------------------------------------------------------------------
+// 真实落字辅助：把 AirType 切成当前桌面的活动输入处理器
+
+void ClickAtCursor() {
+    INPUT input[2]{};
+    input[0].type = INPUT_MOUSE;
+    input[0].mi.dwFlags = MOUSEEVENTF_LEFTDOWN;
+    input[1].type = INPUT_MOUSE;
+    input[1].mi.dwFlags = MOUSEEVENTF_LEFTUP;
+    SendInput(2, input, sizeof(INPUT));
+}
+
+void DescribeWindow(HWND hwnd, const char* tag) {
+    if (hwnd == nullptr) {
+        airtype::log("%s: 无", tag);
+        return;
+    }
+    wchar_t cls[256]{};
+    wchar_t title[256]{};
+    GetClassNameW(hwnd, cls, 256);
+    GetWindowTextW(hwnd, title, 256);
+    DWORD pid = 0;
+    const DWORD tid = GetWindowThreadProcessId(hwnd, &pid);
+    airtype::log("%s: hwnd=%p class=%s title='%s' pid=%lu tid=%lu", tag, hwnd,
+                 utf16_to_utf8(cls).c_str(), utf16_to_utf8(title).c_str(), pid, tid);
+}
+
+int RunCursor() {
+    POINT pt{};
+    if (!GetCursorPos(&pt)) {
+        airtype::log("GetCursorPos 失败: %lu", GetLastError());
+        return 1;
+    }
+    airtype::log("=== 鼠标位置 x=%ld y=%ld ===", pt.x, pt.y);
+    const HWND under = WindowFromPoint(pt);
+    DescribeWindow(under, "鼠标下窗口");
+    DescribeWindow(GetAncestor(under, GA_PARENT), "鼠标下窗口的父窗口");
+    DescribeWindow(GetForegroundWindow(), "前台窗口");
+    DescribeWindow(GetFocus(), "Win32 焦点窗口");
+    return 0;
+}
+
+const char* ControlTypeName(LONG id) {
+    switch (id) {
+        case UIA_EditControlTypeId: return "Edit";
+        case UIA_DocumentControlTypeId: return "Document";
+        case UIA_TextControlTypeId: return "Text";
+        case UIA_ButtonControlTypeId: return "Button";
+        case UIA_ComboBoxControlTypeId: return "ComboBox";
+        case UIA_ListControlTypeId: return "List";
+        case UIA_HyperlinkControlTypeId: return "Hyperlink";
+        default: return "其他";
+    }
+}
+
+// 只读：用 UI Automation 看清鼠标下到底是可编辑控件还是别的什么东西，
+// 避免盲目点击误触按钮。
+int RunUia() {
+    airtype::log("=== UI Automation：鼠标下的元素 ===");
+    HRESULT hr = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+    if (FAILED(hr) && hr != RPC_E_CHANGED_MODE) {
+        airtype::log_hr("CoInitializeEx(STA)", hr);
+        return 1;
+    }
+
+    CComPtr<IUIAutomation> uia;
+    hr = CoCreateInstance(CLSID_CUIAutomation, nullptr, CLSCTX_INPROC_SERVER, IID_IUIAutomation,
+                          reinterpret_cast<void**>(&uia));
+    airtype::log_hr("CoCreateInstance(CLSID_CUIAutomation)", hr);
+    if (FAILED(hr) || !uia) {
+        CoUninitialize();
+        return 1;
+    }
+
+    POINT pt{};
+    GetCursorPos(&pt);
+    CComPtr<IUIAutomationElement> el;
+    hr = uia->ElementFromPoint(pt, &el);
+    airtype::log_hr("ElementFromPoint", hr);
+    if (FAILED(hr) || !el) {
+        CoUninitialize();
+        return 1;
+    }
+
+    CONTROLTYPEID type = 0;
+    el->get_CurrentControlType(&type);
+    BSTR name = nullptr;
+    el->get_CurrentName(&name);
+    BOOL focusable = FALSE;
+    el->get_CurrentIsKeyboardFocusable(&focusable);
+    BOOL focused = FALSE;
+    el->get_CurrentHasKeyboardFocus(&focused);
+    UIA_HWND native = nullptr;
+    el->get_CurrentNativeWindowHandle(&native);
+
+    airtype::log("控件类型: %s (%ld)", ControlTypeName(type), static_cast<LONG>(type));
+    if (name != nullptr) {
+        airtype::log("名称: %s", utf16_to_utf8(name).c_str());
+    } else {
+        airtype::log("名称: (无)");
+    }
+    airtype::log("可键盘聚焦: %s   已聚焦: %s   原生窗口: %p", focusable ? "是" : "否",
+                 focused ? "是" : "否", native);
+    airtype::log("是否 Edit/Document: %s",
+                 (type == UIA_EditControlTypeId || type == UIA_DocumentControlTypeId) ? "是" : "否");
+
+    // 读控件当前内容，作为「文字是否真的落进去」的硬证据。
+    CComPtr<IUIAutomationValuePattern> value;
+    if (SUCCEEDED(el->GetCurrentPattern(UIA_ValuePatternId,
+                                        reinterpret_cast<IUnknown**>(&value))) &&
+        value) {
+        BSTR text = nullptr;
+        if (SUCCEEDED(value->get_CurrentValue(&text)) && text != nullptr) {
+            airtype::log("ValuePattern 内容: '%s'", utf16_to_utf8(text).c_str());
+            SysFreeString(text);
+        } else {
+            airtype::log("ValuePattern 内容: (空)");
+        }
+    } else {
+        CComPtr<IUIAutomationTextPattern> text_pattern;
+        if (SUCCEEDED(el->GetCurrentPattern(UIA_TextPatternId,
+                                            reinterpret_cast<IUnknown**>(&text_pattern))) &&
+            text_pattern) {
+            CComPtr<IUIAutomationTextRange> range;
+            if (SUCCEEDED(text_pattern->get_DocumentRange(&range)) && range) {
+                BSTR text = nullptr;
+                if (SUCCEEDED(range->GetText(256, &text)) && text != nullptr) {
+                    airtype::log("TextPattern 内容: '%s'", utf16_to_utf8(text).c_str());
+                    SysFreeString(text);
+                }
+            }
+        } else {
+            airtype::log("控件内容: (不支持 Value/TextPattern)");
+        }
+    }
+
+    SysFreeString(name);
+    value.Release();
+    CoUninitialize();
+    return 0;
+}
+
+int RunShotFg(const std::string& path_utf8) {
+    const std::wstring path = utf8_to_utf16(path_utf8);
+    airtype::log("=== 抓取整块屏幕 ===");
+    return SaveScreenBmp(path.c_str()) ? 0 : 1;
+}
+
+int RunActivate(bool click) {
+    airtype::log("=== 把 AirType 切成当前桌面的活动输入处理器 ===");
+    HRESULT hr = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+    if (FAILED(hr) && hr != RPC_E_CHANGED_MODE) {
+        airtype::log_hr("CoInitializeEx(STA)", hr);
+        return 1;
+    }
+
+    if (click) {
+        airtype::log("在鼠标当前位置点击左键，让目标输入框拿到焦点");
+        ClickAtCursor();
+        Sleep(400);
+    }
+
+    CComPtr<ITfInputProcessorProfileMgr> mgr;
+    hr = CoCreateInstance(CLSID_TF_InputProcessorProfiles, nullptr, CLSCTX_INPROC_SERVER,
+                          IID_ITfInputProcessorProfileMgr, reinterpret_cast<void**>(&mgr));
+    airtype::log_hr("CoCreateInstance(ITfInputProcessorProfileMgr)", hr);
+    if (FAILED(hr) || !mgr) {
+        CoUninitialize();
+        return 1;
+    }
+
+    // FORSESSION：对当前桌面所有线程生效，前台程序那个线程也会切过来。
+    // DONTCARECURRENTINPUTLANGUAGE：当前输入法语言可能不是 zh-CN，带上否则会失败。
+    const DWORD flags = TF_IPPMF_FORSESSION | TF_IPPMF_DONTCARECURRENTINPUTLANGUAGE;
+
+    // 先记下当前是哪个输入处理器，便于测完切回去。
+    {
+        TF_INPUTPROCESSORPROFILE before{};
+        const HRESULT before_hr = mgr->GetActiveProfile(GUID_TFCAT_TIP_KEYBOARD, &before);
+        if (SUCCEEDED(before_hr)) {
+            wchar_t clsid[64]{};
+            StringFromGUID2(before.clsid, clsid, 64);
+            airtype::log("切换前活动键盘: lang=0x%04X clsid=%s hkl=%p", before.langid,
+                         utf16_to_utf8(clsid).c_str(), reinterpret_cast<void*>(before.hkl));
+        } else {
+            airtype::log_hr("GetActiveProfile(切换前)", before_hr);
+        }
+    }
+
+    hr = mgr->ActivateProfile(TF_PROFILETYPE_INPUTPROCESSOR, 0x0804, CLSID_AIRTYPE_TSF,
+                              GUID_AIRTYPE_PROFILE, nullptr, flags);
+    airtype::log_hr("ActivateProfile(FORSESSION, zh-CN)", hr);
+
+    TF_INPUTPROCESSORPROFILE active{};
+    const HRESULT active_hr = mgr->GetActiveProfile(GUID_TFCAT_TIP_KEYBOARD, &active);
+    airtype::log_hr("GetActiveProfile(TIP_KEYBOARD)", active_hr);
+    if (SUCCEEDED(active_hr)) {
+        wchar_t clsid[64]{};
+        wchar_t profile[64]{};
+        StringFromGUID2(active.clsid, clsid, 64);
+        StringFromGUID2(active.guidProfile, profile, 64);
+        airtype::log("当前活动键盘配置: type=%lu lang=0x%04X clsid=%s profile=%s hkl=%p flags=0x%08lX",
+                     active.dwProfileType, active.langid, utf16_to_utf8(clsid).c_str(),
+                     utf16_to_utf8(profile).c_str(), reinterpret_cast<void*>(active.hkl),
+                     active.dwFlags);
+        airtype::log("AirType 是否已激活: %s", active.clsid == CLSID_AIRTYPE_TSF ? "是" : "否");
+    }
+    // 必须先释放 COM 接口再 CoUninitialize，否则析构在卸载之后进行会崩。
+    mgr.Release();
+    CoUninitialize();
+    return SUCCEEDED(hr) ? 0 : 1;
+}
+
+int RunDeactivate(DWORD flags) {
+    airtype::log("=== 停用 AirType，让系统回退到默认键盘（flags=0x%08lX）===", flags);
+    HRESULT hr = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+    if (FAILED(hr) && hr != RPC_E_CHANGED_MODE) {
+        airtype::log_hr("CoInitializeEx(STA)", hr);
+        return 1;
+    }
+
+    CComPtr<ITfInputProcessorProfileMgr> mgr;
+    hr = CoCreateInstance(CLSID_TF_InputProcessorProfiles, nullptr, CLSCTX_INPROC_SERVER,
+                          IID_ITfInputProcessorProfileMgr, reinterpret_cast<void**>(&mgr));
+    airtype::log_hr("CoCreateInstance(ITfInputProcessorProfileMgr)", hr);
+    if (FAILED(hr) || !mgr) {
+        CoUninitialize();
+        return 1;
+    }
+
+    hr = mgr->DeactivateProfile(TF_PROFILETYPE_INPUTPROCESSOR, 0x0804, CLSID_AIRTYPE_TSF,
+                                GUID_AIRTYPE_PROFILE, nullptr, flags);
+    airtype::log_hr("DeactivateProfile(FORSESSION, zh-CN)", hr);
+
+    TF_INPUTPROCESSORPROFILE active{};
+    const HRESULT active_hr = mgr->GetActiveProfile(GUID_TFCAT_TIP_KEYBOARD, &active);
+    airtype::log_hr("GetActiveProfile(TIP_KEYBOARD)", active_hr);
+    if (SUCCEEDED(active_hr)) {
+        wchar_t clsid[64]{};
+        StringFromGUID2(active.clsid, clsid, 64);
+        airtype::log("当前活动键盘: lang=0x%04X clsid=%s hkl=%p", active.langid,
+                     utf16_to_utf8(clsid).c_str(), reinterpret_cast<void*>(active.hkl));
+        airtype::log("是否已切回非 AirType: %s", active.clsid == CLSID_AIRTYPE_TSF ? "否" : "是");
+    }
+    mgr.Release();
+    CoUninitialize();
+    return SUCCEEDED(hr) ? 0 : 1;
+}
+
 void usage(const char* exe) {
     printf("用法: %s [--write <utf8 text>] [--window] [--shot <out.bmp>] [--ffi <airtype_ffi.dll>]\n",
            exe);
     printf("      %s --marshal    验证 HiddenWindow 跨线程投递与生命周期\n", exe);
     printf("      %s --dllselftest <airtype_tsf.dll>   直接激活文本服务（不注册）\n", exe);
+    printf("      %s --activate [--click]  把 AirType 切进当前桌面（FORSESSION）\n", exe);
+    printf("      %s --deactivate [--flags <n>]  停用 AirType，让系统回退默认键盘\n", exe);
+    printf("      %s --cursor    报告鼠标位置与其下的窗口\n", exe);
+    printf("      %s --uia       用 UI Automation 报告鼠标下的控件类型（只读）\n", exe);
+    printf("      %s --shotfg <out.bmp>  抓整块屏幕，用于核对落字结果\n", exe);
 }
 
 }  // namespace
@@ -673,6 +974,14 @@ int main(int argc, char** argv) {
     bool use_self_window = false;
     bool marshal_test = false;
     std::string dll_selftest;
+    bool activate = false;
+    bool deactivate = false;
+    bool click = false;
+    // DeactivateProfile 不接受 TF_IPPMF_DONTCARECURRENTINPUTLANGUAGE（会 E_INVALIDARG）。
+    DWORD deactivate_flags = 0;
+    bool cursor = false;
+    bool uia = false;
+    std::string shotfg_path;
 
     for (int i = 1; i < argc; ++i) {
         if (strcmp(argv[i], "--write") == 0 && i + 1 < argc) {
@@ -683,6 +992,20 @@ int main(int argc, char** argv) {
             use_self_window = true;
         } else if (strcmp(argv[i], "--marshal") == 0) {
             marshal_test = true;
+        } else if (strcmp(argv[i], "--activate") == 0) {
+            activate = true;
+        } else if (strcmp(argv[i], "--deactivate") == 0) {
+            deactivate = true;
+        } else if (strcmp(argv[i], "--flags") == 0 && i + 1 < argc) {
+            deactivate_flags = static_cast<DWORD>(strtoul(argv[++i], nullptr, 0));
+        } else if (strcmp(argv[i], "--click") == 0) {
+            click = true;
+        } else if (strcmp(argv[i], "--cursor") == 0) {
+            cursor = true;
+        } else if (strcmp(argv[i], "--uia") == 0) {
+            uia = true;
+        } else if (strcmp(argv[i], "--shotfg") == 0 && i + 1 < argc) {
+            shotfg_path = argv[++i];
         } else if (strcmp(argv[i], "--dllselftest") == 0 && i + 1 < argc) {
             dll_selftest = argv[++i];
         } else if (strcmp(argv[i], "--shot") == 0 && i + 1 < argc) {
@@ -695,6 +1018,15 @@ int main(int argc, char** argv) {
         }
     }
 
+    if (cursor) {
+        return RunCursor();
+    }
+    if (uia) {
+        return RunUia();
+    }
+    if (!shotfg_path.empty()) {
+        return RunShotFg(shotfg_path);
+    }
     if (marshal_test) {
         airtype::log("=== AirType HiddenWindow marshal 测试 ===");
         return RunMarshalTest();
@@ -702,6 +1034,12 @@ int main(int argc, char** argv) {
     if (!dll_selftest.empty()) {
         airtype::log("=== AirType TSF DLL 自激活测试 ===");
         return RunDllSelfTest(utf8_to_utf16(dll_selftest));
+    }
+    if (activate) {
+        return RunActivate(click);
+    }
+    if (deactivate) {
+        return RunDeactivate(deactivate_flags);
     }
 
     airtype::log("=== AirType TSF M1 探针 ===");

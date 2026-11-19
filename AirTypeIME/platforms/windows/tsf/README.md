@@ -157,6 +157,20 @@ airtype_tsf_probe.exe --ffi ..\..\..\..\target\release\airtype_ffi.dll
 powershell -ExecutionPolicy Bypass -File build.ps1 -Config Release -ProbeOnly
 ```
 
+模式一览：
+
+| 开关 | 作用 |
+|---|---|
+| （无） | 诊断：报告 TSF 链路各步骤 HRESULT |
+| `--write <text>` / `--preset <text>` / `--window` / `--shot <bmp>` | 自建窗口写入对照 + 截图 |
+| `--ffi <dll>` | 加载并报告 Rust 核心版本 |
+| `--marshal` | 验证 HiddenWindow 跨线程投递与生命周期 |
+| `--dllselftest <dll>` | 直接激活文本服务（不注册） |
+| `--activate [--click]` | 把 AirType 切成当前桌面活动输入处理器 |
+| `--deactivate [--flags <n>]` | 停用 AirType，回退系统默认键盘 |
+| `--cursor` / `--uia` | 报告鼠标位置 / 光标下控件类型与内容（只读） |
+| `--shotfg <bmp>` | 抓整块屏幕 |
+
 ### M1 结论（实测）
 
 1. **COM 编辑会话链路可用**：`CoCreateInstance(ITfThreadMgr)` → `Activate` →
@@ -171,7 +185,7 @@ powershell -ExecutionPolicy Bypass -File build.ps1 -Config Release -ProbeOnly
    整文档转储为 0 字符；写入只进这个隐式文档，控件内容不变。
    说明标准 EDIT / RichEdit 不会自动注册为 TSF 文本存储。
 
-## 注册与卸载（需管理员，尚未执行）
+## 注册与卸载（需管理员）
 
 ```powershell
 # 注册（写 HKCR\CLSID + TSF profile + 键盘类别）
@@ -181,13 +195,106 @@ regsvr32.exe build\bin\airtype_tsf.dll
 regsvr32.exe /u build\bin\airtype_tsf.dll
 ```
 
-注册内容：
-- `HKCR\CLSID\{...}` + `InprocServer32`（`ThreadingModel=Apartment`）
+已于 2026-11-19 用管理员执行注册成功。注册内容：
+- `HKLM\SOFTWARE\Classes\CLSID\{2A953F76-1683-47D8-BCA4-A4C9B3171A1F}`
+  + `InprocServer32`（`ThreadingModel=Apartment`，指向 `build\bin\airtype_tsf.dll`）
 - `ITfInputProcessorProfiles::Register` + `AddLanguageProfile`（zh-CN 0x0804 / en-US 0x0409）
 - `ITfCategoryMgr::RegisterCategory(GUID_TFCAT_TIP_KEYBOARD)`
 
-`airtype_tsf.dll` 会加载同目录（或 `config\airtype.toml` 同目录）的
-`airtype_ffi.dll`。若二者不在一起，需先把 `airtype_ffi.dll` 放到 DLL 旁边。
+## 无硬件端到端测试（AirMicNode 缺席时）
+
+没有 ESP32 也能验证「TSF 落字」这条链路：外壳自己就是 WebSocket 服务端，
+用 `tools/mock_airmic.py` 假装有设备在推流即可。默认配置是 mock 引擎，
+**识别结果与音频内容无关**，所以用正弦波或任意 16k/16bit/mono WAV 都行。
+
+### 先做无 GUI 冒烟（推荐先跑）
+
+`--dllselftest` 会激活文本服务并泵消息 3 秒，这期间外壳的 WebSocket 服务已经
+在监听，可以顺便把协议链路一起验证掉——不需要硬件、不需要切键盘：
+
+```powershell
+# 终端 A：启动外壳（会持续 3 秒）
+.\build\bin\airtype_tsf_probe.exe --dllselftest .\build\bin\airtype_tsf.dll
+
+# 终端 B：等约 1 秒让核心起来，再推流
+python tools/mock_airmic.py --fast
+```
+
+终端 A 应看到：
+
+```
+[airtype] AirType 核心已启动 version=0.1.0 config=(内置默认)
+[airtype] 拿不到焦点文档，缓存本帧文本（23 字符），等焦点到达
+[airtype] [最终] 未写入（已缓存，等焦点） 23 字符
+```
+
+「未写入」是**正确**的：探针线程没有 TSF 焦点文档，走的是丢字兜底分支。
+这一步验证了 `ffi 加载 → 服务监听 → 帧协议 → 引擎 → 回调 → marshal` 全链路。
+
+### 再验真实落字（自动切键盘，已实测）
+
+不用手工点语言栏，`--activate` 直接调 `ITfInputProcessorProfileMgr::ActivateProfile`
+把 AirType 切成**当前桌面所有线程**的活动输入处理器（`TF_IPPMF_FORSESSION`），
+前台程序那个线程也就跟着切过来了。
+
+```powershell
+# 1) 构建（Release 即可，脚本会带上 airtype_ffi.dll）
+powershell -ExecutionPolicy Bypass -File build.ps1 -Config Release
+
+# 2) 确认鼠标下的控件确实是输入框（只读，安全）
+.\build\bin\airtype_tsf_probe.exe --uia
+#    期望 控件类型: Edit，且「已聚焦: 是」
+
+# 3) 切成 AirType（保持鼠标不动，不要点别的地方）
+.\build\bin\airtype_tsf_probe.exe --activate
+#    期望「AirType 是否已激活: 是」
+
+# 4) 推流（在 AirTypeIME 目录下执行）
+python tools/mock_airmic.py --fast
+
+# 5) 读回控件内容，硬证据
+.\build\bin\airtype_tsf_probe.exe --uia
+#    期望 ValuePattern 内容: '你好，这是一次 AirType 语音输入测试。'
+
+# 6) 测完把输入法切回去（否则键盘会被 TIP 接管，无法正常打字）
+.\build\bin\airtype_tsf_probe.exe --deactivate
+```
+
+> **实测结果（2026-11-19）**：对 WorkBuddy 的一个 Edit 控件走完 2→6，
+> 第 5 步 `ValuePattern 内容` 读到了完整识别文本，落字成功。
+>
+> **注意**
+> - `DeactivateProfile` **不接受** `TF_IPPMF_DONTCARECURRENTINPUTLANGUAGE`
+>   （会返回 `E_INVALIDARG`），所以 `--deactivate` 默认 `flags=0`；
+>   `--flags <n>` 仅供试验。
+> - 目标进程加载着 `airtype_ffi.dll` 时重新构建，复制会因文件占用失败。
+>   脚本只警告不中断；`airtype_tsf_probe.exe` 可用 `-ProbeOnly` 单独更新。
+> - 也可以手工切：任务栏输入指示器 → 「AirType 语音输入」
+>   （列表里没有就重启 explorer.exe：TSF 会缓存文本服务列表）。
+
+### 换成真实识别
+
+把 `config\airtype-sherpa.toml` 复制成 DLL 同目录的 `config\airtype.toml`
+（模型路径按实际改），再：
+
+```powershell
+python tools/mock_airmic.py --wav <16k-mono.wav> --fast
+```
+
+`--fast` 只是不等实时节奏，识别质量不受影响。
+
+### 判定要点
+
+| 现象 | 结论 |
+|---|---|
+| 输入框无反应，日志有「核心已启动」 | 键盘没切到 AirType，或 TSF 未加载新 DLL |
+| 输入框无反应，日志报 `加载失败: 126` | `airtype_ffi.dll` 不在 DLL 同目录 |
+| `--activate` 报 `E_INVALIDARG` | 漏了 `TF_IPPMF_DONTCARECURRENTINPUTLANGUAGE` |
+| 出现文字但位置/内容错乱 | 替换式编辑会话问题，看 `[中间]/[最终] 已写入 N 字符` |
+| 日志只有「拿不到焦点文档，缓存本帧文本」 | 焦点不在 TSF 感知控件上 |
+
+> 注意：`--dllselftest` 只验证 COM 激活链路，**核心加载失败时它仍打印「通过」**
+> （`ActivateEx` 起后台线程，失败不回传）。务必同时确认日志里的「核心已启动」。
 
 ## M3 端到端验收标准
 
@@ -242,3 +349,8 @@ airtype_stop();
 - 32 位进程需要 32 位 DLL；Rust 侧需另装 `i686-pc-windows-msvc` target。
 - 卸载输入法前先 `airtype_stop()`，否则 tokio runtime 随 DLL 卸载可能挂起。
 - 注册后 TSF 会缓存文本服务列表，改完 DLL 通常需要重启 explorer.exe 才生效。
+- **COM 生命周期**：所有 `CComPtr` 必须先 `.Release()` 再 `CoUninitialize()`。
+  反过来的话进程退出时会 segfault（`--activate` 曾踩过，表面现象是「打印完最后一行
+  日志后崩」，很难联想到是析构顺序）。
+- 目标进程加载着 `airtype_ffi.dll` / `airtype_tsf.dll` 时，构建脚本复制文件会失败
+  （只警告不中断）。要更新 DLL 先跑 `--deactivate` 让 TSF 卸载。
