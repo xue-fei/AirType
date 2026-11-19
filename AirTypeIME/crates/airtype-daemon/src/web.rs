@@ -116,14 +116,12 @@ async fn handle_connection(mut stream: TcpStream, ctx: Arc<WebCtx>) -> anyhow::R
         ("POST", "/api/raw") => {
             let form = parse_form(&String::from_utf8_lossy(&req.body));
             let text = form.get("raw_toml").cloned().unwrap_or_default();
-            match Config::from_toml(&text) {
+            // 粘贴的 TOML 走和表单同一套校验，否则能绕过 bind/port/inject 检查
+            // 把 daemon 配到起不来。
+            match parse_raw_config(&text) {
                 Ok(config) => save_and_reply(&mut stream, &ctx, config).await,
                 Err(e) => {
-                    let page = render_message(
-                        &ctx,
-                        &format!("TOML 解析失败：{e}\n（配置未改动）"),
-                        true,
-                    );
+                    let page = render_message(&ctx, &format!("保存失败：{e}\n（配置未改动）"), true);
                     respond(
                         &mut stream,
                         400,
@@ -391,8 +389,15 @@ fn apply_form(config: &mut Config, form: &HashMap<String, String>) -> Result<(),
     Ok(())
 }
 
-fn validate(config: &Config) -> Result<(), String> {
-    config
+/// 解析并校验 `/api/raw` 粘贴的 TOML。
+/// 与表单路径共用 `validate`，避免出现「两条保存路径、两套校验」的缺口。
+fn parse_raw_config(text: &str) -> Result<Config, String> {
+    let config = Config::from_toml(text).map_err(|e| format!("TOML 解析失败：{e}"))?;
+    validate(&config)?;
+    Ok(config)
+}
+
+fn validate(config: &Config) -> Result<(), String> {    config
         .server
         .bind
         .parse::<IpAddr>()
@@ -844,5 +849,36 @@ mod tests {
     #[test]
     fn default_config_passes_validation() {
         assert!(validate(&Config::default()).is_ok());
+    }
+
+    #[test]
+    fn raw_config_rejects_zero_server_port() {
+        // 旧行为：raw 路径只解析不校验，端口 0 会被直接写盘。
+        let err = parse_raw_config("[server]\nport = 0\n").unwrap_err();
+        assert!(err.contains("server.port"), "{err}");
+    }
+
+    #[test]
+    fn raw_config_rejects_unknown_inject_mode() {
+        let err = parse_raw_config("[inject]\nmode = \"telepathy\"\n").unwrap_err();
+        assert!(err.contains("inject.mode"), "{err}");
+    }
+
+    #[test]
+    fn raw_config_rejects_invalid_bind() {
+        let err = parse_raw_config("[server]\nbind = \"localhost\"\n").unwrap_err();
+        assert!(err.contains("server.bind"), "{err}");
+    }
+
+    #[test]
+    fn raw_config_reports_toml_syntax_errors() {
+        let err = parse_raw_config("[server\nport = 1").unwrap_err();
+        assert!(err.contains("TOML 解析失败"), "{err}");
+    }
+
+    #[test]
+    fn raw_config_accepts_valid_toml() {
+        let c = parse_raw_config("[server]\nport = 8765\n").unwrap();
+        assert_eq!(c.server.port, 8765);
     }
 }

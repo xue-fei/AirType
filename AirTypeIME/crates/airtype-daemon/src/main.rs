@@ -2,7 +2,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use airtype_core::Config;
-use airtype_daemon::{run_server, run_web, Registry, TextCallback};
+use airtype_daemon::{run_server, run_web, PartialCallback, Registry, TextCallback};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -28,6 +28,15 @@ async fn main() -> anyhow::Result<()> {
 
     let on_text: TextCallback = Arc::new(|text: String| {
         tracing::info!(target: "airtype", "[FINAL TEXT] {text}");
+    });
+
+    let on_partial: PartialCallback = Arc::new(|text: String, delete_chars, append: String| {
+        tracing::debug!(
+            target: "airtype",
+            delete_chars,
+            append,
+            "[PARTIAL] {text}"
+        );
     });
 
     let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
@@ -67,7 +76,7 @@ async fn main() -> anyhow::Result<()> {
         tracing::info!("[web] enabled = false，跳过设置页面");
     }
 
-    run_server(config, registry, on_text, stop_rx).await
+    run_server(config, registry, on_text, on_partial, stop_rx).await
 }
 
 /// 给 anyhow 的 Context 加一条带路径的说明，避免污染主流程。

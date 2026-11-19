@@ -18,6 +18,7 @@ use airtype_core::{Config, Frame, FrameKind, Pipeline, PipelineEvent, Timings};
 use crate::engines;
 use crate::inject::{build_injector, TextInjector};
 use crate::registry::Registry;
+use crate::PartialCallback;
 use crate::TextCallback;
 
 type WsSink = futures_util::stream::SplitSink<WebSocketStream<TcpStream>, Message>;
@@ -50,6 +51,7 @@ struct ServerState {
     streaming: Option<Arc<dyn StreamingAsr>>,
     injector: Arc<dyn TextInjector>,
     on_text: TextCallback,
+    on_partial: PartialCallback,
     /// 设备状态快照，给设置页面用。
     registry: Arc<Registry>,
 }
@@ -59,6 +61,7 @@ pub async fn run_server(
     config: Config,
     registry: Arc<Registry>,
     on_text: TextCallback,
+    on_partial: PartialCallback,
     mut shutdown: oneshot::Receiver<()>,
 ) -> anyhow::Result<()> {
     let requested: SocketAddr = format!("{}:{}", config.server.bind, config.server.port)
@@ -92,6 +95,7 @@ pub async fn run_server(
         streaming: engines.streaming,
         injector,
         on_text,
+        on_partial,
         registry,
     });
 
@@ -137,7 +141,15 @@ async fn handle_connection(
     send(&mut sink, Frame::status(0, "ready", "", "")).await?;
 
     while let Some(msg) = source.next().await {
-        let msg = msg.context("websocket read error")?;
+        // 读错误按断连处理：直接 `?` 返回会跳过 on_disconnected，
+        // 让异常断开的设备在设置页上永远显示「在线」。
+        let msg = match msg {
+            Ok(m) => m,
+            Err(e) => {
+                tracing::warn!(%peer, error = %e, "websocket 读错误，按断连处理");
+                break;
+            }
+        };
         match msg {
             Message::Binary(bytes) => {
                 let frame = match Frame::decode(&bytes) {
@@ -283,6 +295,9 @@ async fn dispatch(
                     tracing::error!(error = %e, delete_chars, "覆盖式注入失败");
                 }
             }
+            // 无论内置注入成功与否都上抛：外壳（TSF/IMK）有自己的写入路径，
+            // pipeline 的 displayed 状态才是「当前应该显示什么」的权威。
+            (state.on_partial)(text.clone(), delete_chars, append.clone());
             send(sink, Frame::status(seq, "partial", &text, "")).await?;
         }
         PipelineEvent::Final {

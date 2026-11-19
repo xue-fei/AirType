@@ -34,10 +34,10 @@ AirType 的 PC 端：接收 AirMic Node 经 Wi-Fi WebSocket 送来的语音，�
 | 共享核心语言 | **Rust + C ABI** | 跨平台不返工；`airtype-core` 不依赖 tokio / Win32，可被任意外壳复用 |
 | 首版交付 | **端到端可跑原型** | 先跑通「AirMic → PC → 输入框」，不啃 COM |
 | 音频帧协议 | **裸 PCM 16kHz/16bit/mono S16LE** | 与既有三端音频流系统一致，256kbps 局域网扛得住；codec 可插拔 |
-| Windows 注入 | **剪贴板 + 模拟 Ctrl+V**（默认 `none`） | 原型最快；正式输入法改用 TSF 编辑会话，不走剪贴板 |
+| Windows 注入 | **TSF in-proc COM DLL**（已实现，待注册联调）；剪贴板 + Ctrl+V 作为无头验证兜底 | 正式输入法走编辑会话，不占剪贴板、不闪字；`inject.mode` 默认 `none` |
 | ASR | **本地离线 sherpa-onnx，Rust 内嵌**，可切换 `mock` / `command` / `sherpa` | 官方 Rust 绑定 crate，模型在 daemon 进程内加载，无 Python 依赖、无 HTTP 往返；默认走**流式 zipformer（fp32，中英）**，边说边出字 |
 
-> **为什么第一版不做 TSF 外壳**：TSF 是注入到别的进程里的 in-proc COM DLL，要编译、注册、跨进程调试，还需要签名与管理权限。先验证链路价值更高。`platforms/windows/tsf/` 已备好 C ABI 头文件与接入说明，随时可接。
+> **TSF 外壳状态**：`platforms/windows/tsf/` 的 `airtype_tsf.dll` 已实现并通过进程内验证（COM 激活、隐藏窗口 marshal、编辑会话写入链路），但**尚未注册进系统**——注册要写 HKLM 且需管理员权限，因此「文字真的落进目标输入框」还没在真实应用里验收。详见 [`platforms/windows/tsf/README.md`](platforms/windows/tsf/README.md)。
 
 ---
 
@@ -64,10 +64,14 @@ AirTypeIME/
 │   │       # web_page.js 由 web.rs 用 include_str! 内嵌进页面
 │   └── airtype-ffi/                 # cdylib，导出 C ABI
 ├── platforms/windows/tsf/
+│   ├── CMakeLists.txt / build.ps1  # MSVC + C++17，产物 build/bin/
 │   ├── include/airtype_ffi.h        # 原生外壳用的头文件
-│   └── README.md                    # TSF 接入步骤
+│   ├── src/                         # dllmain / TsfTextService / TsfEditSession /
+│   │                                # HiddenWindow / FfiBridge / airtype_tsf.def
+│   └── README.md                    # TSF 实现说明、注册步骤与验收标准
 └── tools/
     ├── mock_airmic.py               # 零依赖模拟 AirMic 推流（后台读帧，可看实时 partial）
+    ├── scenario_test.py             # 场景矩阵：非法帧 / 空段 / 断连 / seq 回绕等 10 例
     ├── asr_bridge.py                # command 引擎的 ASR 桥接示例
     ├── fetch_sherpa_libs.sh         # 下载 sherpa-onnx 预编译 native 库（~118MB）
     └── bench_latency.py             # 端到端延迟基准（P50/P95 + 分阶段耗时 + 首字延迟）
@@ -122,12 +126,22 @@ daemon 侧同时会出现 `最终文本: ...` 与 `[INJECT:none] ...`。
 daemon 启动后会额外开一个本机 HTTP 服务（默认 `http://127.0.0.1:8766/`），可以：
 
 - 看当前配置、运行时长、每个 AirMic 的连接状态与识别统计（3 秒轮询 `/api/state`）；
-- 用表单改配置并写回 `airtype.toml`，或整份粘贴 TOML（保存前先解析校验，语法错误不覆盖现有配置）；
+- 用表单改配置并写回 `airtype.toml`，或整份粘贴 TOML（两条路径**共用同一套 `validate`**：bind / 端口 / 注入模式等非法值会被拒绝，不覆盖现有配置）；
 - 改动**重启 daemon 后生效**，当前连接与正在进行的识别不受影响。
 
 四个接口：`GET /`、`GET /api/state`、`POST /api/config`、`POST /api/raw`。服务是手写的最小 HTTP/1.1（`web.rs`），没有引入 axum / tiny_http 之类依赖。
 
 > **安全边界**：默认只监听 `127.0.0.1`。这个页面能改写 ASR 与注入配置，把 `bind` 改成 `0.0.0.0` 前请先确认网络可信。
+
+### 无硬件验证：场景矩阵
+
+没有 AirMic 也能验证 daemon 的状态机。`tools/scenario_test.py` 会起一个临时 daemon（mock 引擎 + 独立端口），跑 10 个场景并断言状态帧序列：
+
+```bash
+python tools/scenario_test.py
+```
+
+覆盖：正常识别、PTT 取消、空语音段、非法帧后连接保持、未 START 就 AUDIO、未 START 就 END、seq 回绕、START 声明 opus 被拒、PING/PONG、中途断连后设备表清理。**新增/改动帧处理逻辑时，先跑这个**。
 
 ### 让文字真的进输入框
 
@@ -294,7 +308,7 @@ python tools/bench_latency.py --wav "<2.wav 路径>" --realtime --count 5
 
 整段路径（`[streaming] enabled = false`，同一模型）实测：10.05s 音频 `asr_ms` **1050ms**，**RTF 0.104**。
 
-> 结论：**流式路径的延迟瓶颈在模型上下文窗口，不在链路**。链路开销已压到个位数毫秒。下一步值得投入的是 TSF 外壳（免去剪贴板副作用）与上电实测真实链路。
+> 结论：**流式路径的延迟瓶颈在模型上下文窗口，不在链路**。链路开销已压到个位数毫秒。剩下的是把 TSF 外壳注册进系统做真实落字验收，以及上电实测 Wi-Fi / 采集 / 按键延迟。
 
 ### 6.6 其他引擎与扩展
 
@@ -308,7 +322,7 @@ python tools/bench_latency.py --wav "<2.wav 路径>" --realtime --count 5
 
 | 平台 | 外壳技术栈 | 状态 |
 |---|---|---|
-| Windows | C++ / TSF (COM in-proc DLL) | 头文件 + 接入说明已备，未实现 |
+| Windows | C++ / TSF (COM in-proc DLL) | **已实现**（`platforms/windows/tsf/`），待注册进系统验收 |
 | macOS | Objective-C++ / InputMethodKit | 复用同一 Rust 核心 + C ABI |
 | Linux | C++ / Fcitx5 或 IBus addon | 复用同一 Rust 核心 + C ABI |
 
@@ -318,11 +332,17 @@ python tools/bench_latency.py --wav "<2.wav 路径>" --realtime --count 5
 #include "airtype_ffi.h"
 
 static void on_text(const char* utf8, void* ud) {
-    /* marshal 到编辑会话线程，用 ITfInsertAtSelection 写入 */
+    /* 回调在 Rust 的 tokio worker 线程触发；marshal 回 UI 线程再写编辑会话 */
+}
+
+static void on_partial(const char* text, int32_t delete_chars,
+                       const char* append, void* ud) {
+    /* text 是当前累积文本；TSF 侧用它整体替换上次写入的范围即可 */
 }
 
 airtype_init("config/airtype.toml");
 airtype_set_text_callback(on_text, NULL);
+airtype_set_partial_callback(on_partial, NULL);
 airtype_start();
 /* ... 退出时 ... */
 airtype_stop();
@@ -340,7 +360,7 @@ FFI 启动时**强制把内置注入设为 `none`**，由外壳负责写入，�
 - 未按 `seq` 做重传（WebSocket 跑在 TCP 上已保证有序），只记录乱序告警。
 - `codec` 只接受 `pcm_s16le`；Opus / ADPCM 需在 `audio.rs` 加解码层。
 - `clipboard_paste` 目前仅 Windows；macOS / Linux 应由原生外壳的编辑会话写入。
-- **流式实时上屏的代价**：`replace = true` 时靠「模拟退格 N 次 + Ctrl+V」覆盖已上屏文本，会反复占用剪贴板，且要求焦点窗口的光标位置不动；退格次数多时肉眼可见文字闪动。正规解法是 TSF composition（预编辑串），需要 C++ COM 外壳，`platforms/windows/tsf/` 已备好接入说明。
+- **流式实时上屏的两条路径**：内置 `clipboard_paste` 靠「退格 N 次 + Ctrl+V」覆盖已上屏文本，会反复占用剪贴板、要求光标不动，退格多时肉眼可见闪动；Windows TSF 外壳改用编辑会话**整体替换**同一段 `ITfRange`，不碰剪贴板（已实现，见 §7 与 [`platforms/windows/tsf/README.md`](platforms/windows/tsf/README.md)）。
 - 流式模型无标点、英文按大写字母分词输出（transducer 特性）；`postprocess` 只在收尾补句末标点，partial 阶段刻意不补，避免标点闪烁。
 - ASR 已内嵌 sherpa-onnx（Rust，零 Python），但只支持 zipformer transducer 一种模型结构；换 SenseVoice / paraformer 需要给 `airtype-asr-sherpa` 加配置变体。
 - 6.4 的延迟是**本地回环 + 已生成的 WAV**，不含 Wi-Fi 传输、INMP441 采集与按键物理延迟，这些必须上电实测。

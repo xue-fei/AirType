@@ -12,7 +12,7 @@ use std::ffi::{c_char, c_void, CStr, CString};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use airtype_core::Config;
-use airtype_daemon::{run_server, Registry, TextCallback};
+use airtype_daemon::{run_server, PartialCallback, Registry, TextCallback};
 
 const AIRTYPE_OK: i32 = 0;
 const AIRTYPE_ERR_CONFIG: i32 = -2;
@@ -21,12 +21,16 @@ const AIRTYPE_ERR_UTF8: i32 = -4;
 const AIRTYPE_ERR_INTERNAL: i32 = -5;
 
 type TextCb = extern "C" fn(*const c_char, *mut c_void);
+/// `(累积文本, 需退格字符数, 增量文本, userdata)`。
+/// `delete_chars` 用 i32 是为了跨语言对齐；负数按 0 处理。
+type PartialCb = extern "C" fn(*const c_char, i32, *const c_char, *mut c_void);
 
 struct Global {
     runtime: Option<tokio::runtime::Runtime>,
     config: Option<Config>,
     /// 函数指针 + userdata 的指针值（存 usize 以保持 Global: Send）
     callback: Option<(TextCb, usize)>,
+    partial_callback: Option<(PartialCb, usize)>,
     shutdown: Option<tokio::sync::oneshot::Sender<()>>,
     last_error: CString,
 }
@@ -37,6 +41,7 @@ impl Default for Global {
             runtime: None,
             config: None,
             callback: None,
+            partial_callback: None,
             shutdown: None,
             last_error: CString::new("").unwrap(),
         }
@@ -113,6 +118,17 @@ pub extern "C" fn airtype_set_text_callback(
 }
 
 #[no_mangle]
+pub extern "C" fn airtype_set_partial_callback(
+    cb: Option<PartialCb>,
+    userdata: *mut c_void,
+) -> i32 {
+    let mut g = global().lock().unwrap();
+    g.partial_callback = cb.map(|f| (f, userdata as usize));
+    store_error(&mut g, "");
+    AIRTYPE_OK
+}
+
+#[no_mangle]
 pub extern "C" fn airtype_start() -> i32 {
     let mut g = global().lock().unwrap();
     if g.runtime.is_none() || g.config.is_none() {
@@ -138,9 +154,30 @@ pub extern "C" fn airtype_start() -> i32 {
         }
     });
 
+    let on_partial: PartialCallback =
+        Arc::new(|text: String, delete_chars: usize, append: String| {
+            let cb = global().lock().unwrap().partial_callback;
+            if let Some((f, userdata)) = cb {
+                let delete_i32 = delete_chars.min(i32::MAX as usize) as i32;
+                match (CString::new(text), CString::new(append)) {
+                    (Ok(t), Ok(a)) => f(t.as_ptr(), delete_i32, a.as_ptr(), userdata as *mut c_void),
+                    // 文本含 NUL 属于异常输入，宁可丢这一次 partial 也不传野指针。
+                    _ => tracing::warn!("partial text contains NUL; callback skipped"),
+                }
+            }
+        });
+
     let (tx, rx) = tokio::sync::oneshot::channel::<()>();
     g.runtime.as_ref().unwrap().spawn(async move {
-        if let Err(e) = run_server(config, Arc::new(Registry::new()), on_text, rx).await {
+        if let Err(e) = run_server(
+            config,
+            Arc::new(Registry::new()),
+            on_text,
+            on_partial,
+            rx,
+        )
+        .await
+        {
             tracing::error!("AirTypeIME server stopped: {e:#}");
         }
     });
@@ -161,6 +198,7 @@ pub extern "C" fn airtype_stop() {
     }
     g.config = None;
     g.callback = None;
+    g.partial_callback = None;
 }
 
 #[no_mangle]

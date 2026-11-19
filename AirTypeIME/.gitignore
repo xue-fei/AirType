@@ -12,6 +12,8 @@
 config/local.toml
 __pycache__/
 *.pyc
+# TSF 外壳的 CMake/Ninja 构建目录
+/platforms/windows/tsf/build/
 # 本地 ASR 模型（SenseVoice int8 解压后 ~230MB），不入库
 /models/
 # sherpa-onnx 预编译 native 库归档（~118MB），由 tools/fetch_sherpa_libs.sh 下载
