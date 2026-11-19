@@ -37,10 +37,15 @@ STDMETHODIMP ReplaceEditSession::DoEditSession(TfEditCookie ec) {
     if (previous_) {
         const HRESULT cloned = previous_->Clone(&target);
         if (FAILED(cloned)) {
-            airtype::log_hr("Clone(上次写入 range)", cloned);
-            return cloned;
+            // 上次写入的 range 会被文档自身的改动（用户手打、应用重排、
+            // 换焦点后重建）作废。此时不能直接失败——那会让后续每一帧
+            // 都替换同一段死 range，整段文字再也不更新。回退到当前选区。
+            airtype::log_hr("Clone(上次写入 range)，回退到当前选区", cloned);
+            previous_.Release();
+            target.Release();
         }
-    } else {
+    }
+    if (!target) {
         TF_SELECTION sel{};
         ULONG fetched = 0;
         HRESULT hr = ctx_->GetSelection(ec, TF_DEFAULT_SELECTION, 1, &sel, &fetched);
@@ -69,9 +74,15 @@ STDMETHODIMP ReplaceEditSession::DoEditSession(TfEditCookie ec) {
     written_ = target;
 
     // 光标停在新文本末尾，用户接着打字时不会插到中间。
+    // 注意：缓存的 written_ 不能折叠（下次还要靠它定位），折叠克隆出来的 caret。
     CComPtr<ITfRange> caret;
-    if (SUCCEEDED(written_->Clone(&caret))) {
-        caret->Collapse(ec, TF_ANCHOR_END);
+    if (SUCCEEDED(written_->Clone(&caret)) &&
+        SUCCEEDED(caret->Collapse(ec, TF_ANCHOR_END))) {
+        TF_SELECTION sel{};
+        sel.range = caret;
+        sel.style.ase = TF_AE_NONE;
+        sel.style.fInterimChar = FALSE;
+        ctx_->SetSelection(ec, 1, &sel);
     }
     return S_OK;
 }

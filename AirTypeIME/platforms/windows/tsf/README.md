@@ -9,7 +9,7 @@
 |---|---|---|
 | M1 | CMake 工程 + `airtype_tsf_probe` 风险探针 + `FfiBridge` | ✅ 已完成 |
 | M2 | `airtype_tsf.dll`：`ITfTextInputProcessorEx` + 编辑会话 + 注册 | ✅ 代码完成，待注册联调 |
-| M3 | `HiddenWindow` marshal、生命周期、端到端联调 | 🔶 marshal 已验证，落字待联调 |
+| M3 | `HiddenWindow` marshal、生命周期、端到端联调 | ✅ marshal + 真实落字均已验证（2026-11-19） |
 
 > **尚未执行任何注册/卸载操作**。注册会写 HKLM 并可能要求重启 `explorer.exe`，
 > 需要明确指示后再做。
@@ -84,6 +84,17 @@ partial 与 final 走同一条替换路径，保证「边说边出字」和最�
 
 **丢字兜底**：TSF 焦点可能晚于文本到达（例如刚点进输入框）。`WriteText` 拿不到
 焦点文档时不再直接丢弃，而是缓存本帧文本，等 `OnSetFocus` 到达时补写。
+
+**替换后复位光标**：`ITfRange::SetText` 写完会留下选中态，下一次替换若沿用同一个
+range 起始锚点，插入位置会跑偏。因此替换完成后不折叠缓存的 `written_`（折叠会破坏
+下一帧替换的区间），而是克隆一个 caret、`Collapse(TF_ANCHOR_END)`，再
+`ITfContext::SetSelection(ec, 1, &sel)`（`ase = TF_AE_NONE`）把焦点后的光标位置
+显式交回 TSF。这与 M1 探针已验证的写入后处理一致。
+
+**缓存 range 失效回退**：TSF 的 `ITfRange` 在文档被外部改动后会被作废，
+`Clone(previous_)` 可能失败。此时不再直接放弃本帧，而是丢弃旧 range、回退到
+`GetSelection(TF_DEFAULT_SELECTION)` 取当前选区重写；写入失败也会
+`ResetWrittenRange()`，让下一帧改用当前选区，避免连续失败导致整段文本丢失。
 
 ## HiddenWindow marshal 验证
 
