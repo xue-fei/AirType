@@ -41,6 +41,17 @@ extern "C" {
  * 外壳需自行 marshal 到 UI/编辑会话线程，不要在此回调里做耗时操作。 */
 typedef void (*airtype_text_cb)(const char *utf8_text, void *userdata);
 
+/* 流式识别的中间结果回调（边说边出字）。每次 partial 触发一次。
+ *
+ *   utf8_text    : 当前累积文本，即「此刻输入框里应该显示什么」
+ *   delete_chars : 相对上一次上屏文本需要退格的字符数（Unicode 字符，非字节）
+ *   append       : 退格之后需要追加的增量文本
+ *
+ * 外壳可以只取 utf8_text 做整体替换，也可以按 delete_chars/append 做最小编辑。
+ * 与 airtype_text_cb 同在库内部线程触发，同样需要 marshal。 */
+typedef void (*airtype_partial_cb)(const char *utf8_text, int32_t delete_chars,
+                                   const char *utf8_append, void *userdata);
+
 /* 库版本号，静态字符串。 */
 AIRTYPE_API const char *airtype_version(void);
 
@@ -51,6 +62,10 @@ AIRTYPE_API int32_t airtype_init(const char *config_path_utf8);
 /* 注册最终文本回调。可在 airtype_start() 之前或之后调用。
  * 传 cb=NULL 表示取消回调。 */
 AIRTYPE_API int32_t airtype_set_text_callback(airtype_text_cb cb, void *userdata);
+
+/* 注册流式中间结果回调。语义同 airtype_set_text_callback。
+ * 不注册时 partial 只在库内记日志，不影响最终文本。 */
+AIRTYPE_API int32_t airtype_set_partial_callback(airtype_partial_cb cb, void *userdata);
 
 /* 启动 WebSocket 服务（非阻塞，内部起 tokio runtime）。 */
 AIRTYPE_API int32_t airtype_start(void);

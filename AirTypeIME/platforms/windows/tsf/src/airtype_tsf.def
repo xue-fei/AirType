@@ -1,0 +1,16 @@
+; airtype_tsf.dll 导出表。
+;
+; STDAPI 宏只带 extern "C" + __stdcall，不含 dllexport，
+; 因此 COM 入口必须用 .def 显式导出，否则 regsvr32 / 系统激活时
+; GetProcAddress("DllGetClassObject") 会失败。
+;
+; PRIVATE：仍然导出（GetProcAddress 可用），但不进导入库，
+; 避免被当成普通函数链接。
+
+LIBRARY airtype_tsf
+
+EXPORTS
+    DllGetClassObject   PRIVATE
+    DllCanUnloadNow     PRIVATE
+    DllRegisterServer   PRIVATE
+    DllUnregisterServer PRIVATE

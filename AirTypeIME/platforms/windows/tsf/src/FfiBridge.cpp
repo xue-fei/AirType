@@ -1,0 +1,101 @@
+#include "FfiBridge.h"
+
+#include <string>
+
+#include "Log.h"
+
+namespace airtype {
+
+namespace {
+
+std::wstring DefaultSearchPath() {
+    // 先找 exe 同目录，便于把 airtype_ffi.dll 和外壳放在一起分发。
+    wchar_t exe[MAX_PATH]{};
+    if (GetModuleFileNameW(nullptr, exe, MAX_PATH) > 0) {
+        std::wstring dir(exe);
+        const size_t slash = dir.find_last_of(L"\\/");
+        if (slash != std::wstring::npos) {
+            return dir.substr(0, slash + 1) + L"airtype_ffi.dll";
+        }
+    }
+    return L"airtype_ffi.dll";
+}
+
+}  // namespace
+
+FfiBridge::~FfiBridge() {
+    // 不 FreeLibrary：DLL 里的 tokio runtime 退出时可能还在用模块。
+    // 与外壳同生命周期，进程退出时由系统回收。
+}
+
+void* FfiBridge::Proc(const char* name) const {
+    if (dll_ == nullptr) {
+        return nullptr;
+    }
+    return reinterpret_cast<void*>(GetProcAddress(dll_, name));
+}
+
+bool FfiBridge::Load(const std::wstring& path) {
+    const std::wstring target = path.empty() ? DefaultSearchPath() : path;
+    dll_ = LoadLibraryW(target.c_str());
+    if (dll_ == nullptr) {
+        last_error_ = "LoadLibraryW 失败: " + std::to_string(GetLastError());
+        return false;
+    }
+
+    version_ = reinterpret_cast<FnVersion>(Proc("airtype_version"));
+    init_ = reinterpret_cast<FnInit>(Proc("airtype_init"));
+    set_text_ = reinterpret_cast<FnSetText>(Proc("airtype_set_text_callback"));
+    set_partial_ = reinterpret_cast<FnSetPartial>(Proc("airtype_set_partial_callback"));
+    start_ = reinterpret_cast<FnStart>(Proc("airtype_start"));
+    stop_ = reinterpret_cast<FnStop>(Proc("airtype_stop"));
+    last_error_proc_ = reinterpret_cast<FnLastError>(Proc("airtype_last_error"));
+
+    if (version_ == nullptr || init_ == nullptr || set_text_ == nullptr ||
+        set_partial_ == nullptr || start_ == nullptr || stop_ == nullptr) {
+        last_error_ = "导出表不完整（airtype_ffi.dll 版本过旧？）";
+        return false;
+    }
+    last_error_.clear();
+    return true;
+}
+
+const char* FfiBridge::Version() const {
+    return version_ ? version_() : "";
+}
+
+int32_t FfiBridge::Init(const std::string& config_path_utf8) {
+    if (!init_) {
+        return AIRTYPE_ERR_INTERNAL;
+    }
+    return init_(config_path_utf8.empty() ? nullptr : config_path_utf8.c_str());
+}
+
+int32_t FfiBridge::SetTextCallback(airtype_text_cb cb, void* userdata) {
+    if (!set_text_) {
+        return AIRTYPE_ERR_INTERNAL;
+    }
+    return set_text_(cb, userdata);
+}
+
+int32_t FfiBridge::SetPartialCallback(airtype_partial_cb cb, void* userdata) {
+    if (!set_partial_) {
+        return AIRTYPE_ERR_INTERNAL;
+    }
+    return set_partial_(cb, userdata);
+}
+
+int32_t FfiBridge::Start() {
+    if (!start_) {
+        return AIRTYPE_ERR_INTERNAL;
+    }
+    return start_();
+}
+
+void FfiBridge::Stop() {
+    if (stop_) {
+        stop_();
+    }
+}
+
+}  // namespace airtype
