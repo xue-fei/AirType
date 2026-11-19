@@ -14,7 +14,11 @@ param(
     [ValidateSet("Debug", "Release")]
     [string]$Config = "Debug",
 
-    [switch]$Clean
+    [switch]$Clean,
+
+    # 只重建探针 exe。目标进程加载着 airtype_tsf.dll / airtype_ffi.dll 时，
+    # 链接器写不进去，用这一个选项先更新探针（例如新增 --deactivate）。
+    [switch]$ProbeOnly
 )
 
 $ErrorActionPreference = "Stop"
@@ -109,10 +113,37 @@ New-Item -ItemType Directory -Force -Path $BuildDir | Out-Null
     "-DCMAKE_MAKE_PROGRAM=$Ninja"
 if ($LASTEXITCODE -ne 0) { throw "CMake 配置失败" }
 
+if ($ProbeOnly) {
+    & $CMake --build $BuildDir --target airtype_tsf_probe
+    if ($LASTEXITCODE -ne 0) { throw "构建失败" }
+    Write-Host "探针已更新：$BinDir\airtype_tsf_probe.exe"
+    return
+}
+
 & $CMake --build $BuildDir
 if ($LASTEXITCODE -ne 0) { throw "构建失败" }
 
 New-Item -ItemType Directory -Force -Path $BinDir | Out-Null
+
+# 外壳是 in-proc DLL，运行期按「自身所在目录」加载 airtype_ffi.dll
+# （见 src/ModuleUtil.cpp），所以构建后必须把 Rust 侧的产物同步过来。
+# 少了这一步会表现为激活成功但日志报「airtype_ffi.dll 加载失败: 126」。
+$ImeRoot = (Resolve-Path (Join-Path $Root "..\..\..")).Path
+$CargoProfile = if ($Config -eq "Debug") { "debug" } else { "release" }
+$Ffi = Join-Path $ImeRoot "target\$CargoProfile\airtype_ffi.dll"
+if (Test-Path $Ffi) {
+    try {
+        Copy-Item $Ffi $BinDir -Force -ErrorAction Stop
+        Write-Host "已同步 airtype_ffi.dll（$CargoProfile）"
+    } catch {
+        # 目标进程还加载着旧版本时文件被占用，属预期情况，不该让构建失败。
+        Write-Host "警告：airtype_ffi.dll 被占用，未能更新（有进程仍加载着文本服务）。"
+        Write-Host "      先跑 airtype_tsf_probe.exe --deactivate 再重新构建。"
+    }
+} else {
+    Write-Host "警告：未找到 $Ffi，请先构建 Rust 侧；外壳会因缺少核心而无法启动。"
+}
+
 Write-Host ""
 Write-Host "构建完成：$BinDir"
 Get-ChildItem $BinDir | ForEach-Object { Write-Host "  $($_.Name)" }

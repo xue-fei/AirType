@@ -17,6 +17,8 @@
 #include <windows.h>
 #include <msctf.h>
 #include <richedit.h>
+#include <uiautomation.h>
+
 
 #include <atlbase.h>
 #include <cstdio>

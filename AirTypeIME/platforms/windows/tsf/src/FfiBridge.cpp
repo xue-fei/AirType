@@ -1,24 +1,32 @@
 #include "FfiBridge.h"
 
 #include <string>
+#include <windows.h>
 
 #include "Log.h"
+#include "ModuleUtil.h"
 
 namespace airtype {
 
 namespace {
 
 std::wstring DefaultSearchPath() {
-    // 先找 exe 同目录，便于把 airtype_ffi.dll 和外壳放在一起分发。
-    wchar_t exe[MAX_PATH]{};
-    if (GetModuleFileNameW(nullptr, exe, MAX_PATH) > 0) {
-        std::wstring dir(exe);
-        const size_t slash = dir.find_last_of(L"\\/");
-        if (slash != std::wstring::npos) {
-            return dir.substr(0, slash + 1) + L"airtype_ffi.dll";
+    // 外壳是 in-proc 服务器，会被注入到任意宿主进程（记事本、Word…），
+    // 宿主 exe 目录下通常没有 airtype_ffi.dll，因此优先按本模块目录找；
+    // 探针等独立 exe 把 ffi 放在自己旁边的用法继续兼容。
+    const std::wstring dirs[] = {SelfModuleDir(), HostExeDir()};
+    for (const std::wstring& dir : dirs) {
+        if (dir.empty()) {
+            continue;
+        }
+        const std::wstring candidate = dir + L"airtype_ffi.dll";
+        if (GetFileAttributesW(candidate.c_str()) != INVALID_FILE_ATTRIBUTES) {
+            return candidate;
         }
     }
-    return L"airtype_ffi.dll";
+    // 两个目录都没有时，让 LoadLibrary 的错误信息指向最可能的位置。
+    const std::wstring dir = SelfModuleDir();
+    return dir.empty() ? std::wstring(L"airtype_ffi.dll") : dir + L"airtype_ffi.dll";
 }
 
 }  // namespace

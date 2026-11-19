@@ -54,8 +54,9 @@ private:
     void OnPayload(AirTypePayload* payload);
     /// 焦点到达时补写之前因「拿不到焦点文档」而缓存的文本。
     void FlushPending();
-    /// 把文本写进当前输入框。
-    void WriteText(const std::wstring& text);
+    /// 把文本写进当前输入框。返回 false 表示本帧没落地（缓存待焦点、
+    /// 拿不到 context 或编辑会话失败），日志不能报「已写入」。
+    bool WriteText(const std::wstring& text);
     /// 换文档/丢焦点时清空「已写入范围」，避免跨文档误替换。
     void ResetWrittenRange();
     std::wstring ResolveConfigPath() const;

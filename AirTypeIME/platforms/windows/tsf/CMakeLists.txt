@@ -21,6 +21,7 @@ add_executable(airtype_tsf_probe
     src/TsfProbe.cpp
     src/FfiBridge.cpp
     src/HiddenWindow.cpp
+    src/ModuleUtil.cpp
     src/TsfGuids.cpp
 )
 
@@ -40,6 +41,7 @@ target_link_libraries(airtype_tsf_probe PRIVATE
     ole32
     oleaut32
     uuid
+    UIAutomationCore
 )
 
 # 产物统一放到 build/bin，方便 build.ps1 收集。
@@ -55,6 +57,7 @@ add_library(airtype_tsf MODULE
     src/TsfEditSession.cpp
     src/HiddenWindow.cpp
     src/FfiBridge.cpp
+    src/ModuleUtil.cpp
     src/TsfGuids.cpp
     src/airtype_tsf.def
 )

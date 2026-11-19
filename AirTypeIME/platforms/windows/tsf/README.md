@@ -8,11 +8,13 @@
 | 阶段 | 内容 | 状态 |
 |---|---|---|
 | M1 | CMake 工程 + `airtype_tsf_probe` 风险探针 + `FfiBridge` | ✅ 已完成 |
-| M2 | `airtype_tsf.dll`：`ITfTextInputProcessorEx` + 编辑会话 + 注册 | ✅ 代码完成，待注册联调 |
+| M2 | `airtype_tsf.dll`：`ITfTextInputProcessorEx` + 编辑会话 + 注册 | ✅ 已完成（2026-11-19 管理员 `regsvr32` 注册成功） |
 | M3 | `HiddenWindow` marshal、生命周期、端到端联调 | ✅ marshal + 真实落字均已验证（2026-11-19） |
 
-> **尚未执行任何注册/卸载操作**。注册会写 HKLM 并可能要求重启 `explorer.exe`，
-> 需要明确指示后再做。
+> **注册状态**：`{2A953F76-1683-47D8-BCA4-A4C9B3171A1F}` 已写入
+> `HKLM\SOFTWARE\Classes\CLSID`，语言配置与键盘类别均已注册（2026-11-19）。
+> 注册路径固定指向 `build\bin\airtype_tsf.dll`，**重新构建不会失效**；只有移动
+> DLL 或换机器才需要重新注册。
 
 ## 目录
 
@@ -27,6 +29,7 @@ tsf/
 │   ├── TsfGuids.h/.cpp     文本服务 CLSID / profile GUID
 │   ├── TsfTypes.h          自定义消息 + AirTypePayload
 │   ├── FfiBridge.h/.cpp    airtype_ffi.dll 的加载与封装
+│   ├── ModuleUtil.h/.cpp   本模块目录 / 宿主 exe 目录解析
 │   ├── TsfString.h         UTF-8 <-> UTF-16
 │   ├── HiddenWindow.h/.cpp MTA 回调 -> STA 线程的 marshal
 │   ├── TsfEditSession.h/.cpp  替换式编辑会话（带写入范围缓存）
@@ -48,7 +51,29 @@ powershell -ExecutionPolicy Bypass -File build.ps1 -Config Release -Clean
 | 文件 | 说明 |
 |---|---|
 | `build/bin/airtype_tsf.dll` | in-proc COM 服务器（TSF 文本服务） |
+| `build/bin/airtype_ffi.dll` | 脚本自动从 `target\<config>\` 同步过来的 Rust 核心 |
 | `build/bin/airtype_tsf_probe.exe` | 独立探针，不注册、不注入 |
+
+> `build.ps1` 构建完成后会**自动把 `airtype_ffi.dll` 复制进 `build\bin`**。
+> 少了它 `--dllselftest` 会报 `airtype_ffi.dll 加载失败: 126`（`ERROR_MOD_NOT_FOUND`），
+> 但 COM 激活仍然返回 `S_OK`——判断核心是否起来要看日志里的「核心已启动」，
+> 不要只看「测试通过」。
+
+## 运行期文件布局
+
+外壳是 in-proc DLL，会被系统注入到任意宿主进程（记事本、Word…），**宿主 exe
+目录下不会有 `airtype_ffi.dll`**。因此加载路径按「本模块目录 → 宿主 exe 目录」
+两级查找（`src/ModuleUtil.cpp`）：
+
+| 文件 | 查找顺序 | 缺失后果 |
+|---|---|---|
+| `airtype_ffi.dll` | DLL 同目录 → 宿主 exe 同目录 | 核心起不来，激活仍返回 `S_OK` |
+| `config\airtype.toml` | DLL 同目录 → 宿主 exe 同目录 | 回退到 `Config::default()`（mock 引擎、127.0.0.1:8765） |
+| `airtype.toml` | 同上 | 同上 |
+
+> 早期版本只查宿主 exe 目录，注入到记事本后必然加载失败。跨目录验证方法：
+> 把 `airtype_tsf_probe.exe` 单独复制到空目录，用绝对路径指向 `build\bin` 的
+> DLL 跑 `--dllselftest`——修复前报 126，修复后「核心已启动」。
 
 `build.ps1` 不调用 `vcvars64.bat`——它会用 `reg.exe` 查注册表，在受限环境下会失败。
 脚本直接拼装 `INCLUDE` / `LIB` / `PATH`，用 VS 自带的 `cmake.exe` + `ninja.exe`。
@@ -61,17 +86,18 @@ powershell -ExecutionPolicy Bypass -File build.ps1 -Config Release -Clean
 ## 运行链路
 
 ```
-ESP32-S3 麦克风 --WiFi--> airtype-daemon(Rust)
-                             │  WebSocket 帧协议 v1
+ESP32-S3 麦克风 --WiFi--> airtype_tsf.dll 内置的 WebSocket 服务（127.0.0.1:8765）
+                             │  帧协议 v1（Start / Audio… / End）
                              ▼
-                    airtype_ffi.dll（tokio worker / MTA）
+                    airtype_ffi.dll（tokio runtime / MTA）
                              │  on_text / on_partial 裸指针回调
-                             ▼
-                    airtype_tsf.dll（被注入目标进程）
                              │  PostMessage 到隐藏窗口（marshal 回 STA）
                              ▼
                     ITfContext::RequestEditSession -> ITfRange::SetText
 ```
+
+> 外壳自身就是服务端：`airtype_start()` 调用 `airtype_daemon::run_server`，
+> 不需要另外启动 `airtype-daemon.exe`。配置里的 `[server]` 决定监听地址。
 
 **partial 策略**：不用 TSF composition。外壳记住上次写入的 `ITfRange`，每次
 partial / final 到达就用累积文本整体替换该 range；换焦点文档时丢弃旧 range。
@@ -126,6 +152,9 @@ airtype_tsf_probe.exe --window --preset "预设ABC" --write "你好，TSF" --sho
 
 # 加载 Rust 核心，验证导出表
 airtype_tsf_probe.exe --ffi ..\..\..\..\target\release\airtype_ffi.dll
+
+# 只重建本 exe（目标进程锁住 DLL 时用）
+powershell -ExecutionPolicy Bypass -File build.ps1 -Config Release -ProbeOnly
 ```
 
 ### M1 结论（实测）
@@ -169,7 +198,8 @@ regsvr32.exe /u build\bin\airtype_tsf.dll
    - 松手后最终文本与中间态一致，无重复、无残留；
    - 切换输入框 / 窗口后不会写错文档。
 4. 日志（DebugView 或 stderr）应出现 `[中间] 已写入 N 字符` 递增，最后一条
-   `[最终] 已写入 N 字符`。
+   `[最终] 已写入 N 字符`。日志现在会区分「已写入」与「未写入（已缓存，等焦点）」，
+   后者说明焦点还不在 TSF 感知控件上，不要当成成功。
 
 ## C ABI 契约
 

@@ -3,6 +3,7 @@
 #include <utility>
 
 #include "Log.h"
+#include "ModuleUtil.h"
 #include "TsfEditSession.h"
 #include "TsfString.h"
 
@@ -193,22 +194,19 @@ void TsfTextService::StopCore() {
 }
 
 std::wstring TsfTextService::ResolveConfigPath() const {
-    // 配置文件优先找 exe/DLL 同目录的 config\airtype.toml，其次同目录 airtype.toml。
-    wchar_t module[MAX_PATH]{};
-    if (GetModuleFileNameW(nullptr, module, MAX_PATH) == 0) {
-        return {};
-    }
-    std::wstring dir(module);
-    const size_t slash = dir.find_last_of(L"\\/");
-    if (slash == std::wstring::npos) {
-        return {};
-    }
-    dir = dir.substr(0, slash + 1);
-
-    const std::wstring candidates[] = {dir + L"config\\airtype.toml", dir + L"airtype.toml"};
-    for (const auto& path : candidates) {
-        if (GetFileAttributesW(path.c_str()) != INVALID_FILE_ATTRIBUTES) {
-            return path;
+    // 配置文件优先找本模块同目录的 config\airtype.toml，其次同目录 airtype.toml。
+    // 宿主 exe 目录作为兜底：独立探针把配置放在自己旁边时仍然可用。
+    const std::wstring dirs[] = {SelfModuleDir(), HostExeDir()};
+    const std::wstring names[] = {L"config\\airtype.toml", L"airtype.toml"};
+    for (const std::wstring& dir : dirs) {
+        if (dir.empty()) {
+            continue;
+        }
+        for (const std::wstring& name : names) {
+            const std::wstring path = dir + name;
+            if (GetFileAttributesW(path.c_str()) != INVALID_FILE_ATTRIBUTES) {
+                return path;
+            }
         }
     }
     return {};
@@ -265,8 +263,9 @@ void TsfTextService::OnPayload(AirTypePayload* payload) {
     if (text.empty()) {
         return;
     }
-    WriteText(text);
-    airtype::log("%s已写入 %d 字符", final ? "[最终] " : "[中间] ",
+    const bool written = WriteText(text);
+    airtype::log("%s%s %d 字符", final ? "[最终] " : "[中间] ",
+                 written ? "已写入" : "未写入（已缓存，等焦点）",
                  static_cast<int>(text.size()));
 }
 
@@ -289,9 +288,9 @@ void TsfTextService::FlushPending() {
     WriteText(text);
 }
 
-void TsfTextService::WriteText(const std::wstring& text) {
+bool TsfTextService::WriteText(const std::wstring& text) {
     if (!thread_mgr_) {
-        return;
+        return false;
     }
 
     CComPtr<ITfDocumentMgr> doc = current_doc_;
@@ -304,13 +303,13 @@ void TsfTextService::WriteText(const std::wstring& text) {
             has_pending_ = true;
             airtype::log("拿不到焦点文档，缓存本帧文本（%d 字符），等焦点到达",
                          static_cast<int>(text.size()));
-            return;
+            return false;
         }
     }
 
     CComPtr<ITfContext> ctx;
     if (FAILED(doc->GetTop(&ctx)) || !ctx) {
-        return;
+        return false;
     }
 
     // 换了文档就放弃上一段写入范围，否则会替换到别的应用里。
@@ -329,11 +328,17 @@ void TsfTextService::WriteText(const std::wstring& text) {
             range->AddRef();
             written_range_.Attach(range);
         }
-    } else {
-        airtype::log_hr("RequestEditSession", hr);
-        airtype::log_hr("  DoEditSession", session_hr);
+        session->Release();
+        return true;
     }
+
+    airtype::log_hr("RequestEditSession", hr);
+    airtype::log_hr("  DoEditSession", session_hr);
+    // 这次写入没落地，缓存的 range 已不可信（可能正是它导致失败），
+    // 下帧改用当前选区，避免连续失败。
+    ResetWrittenRange();
     session->Release();
+    return false;
 }
 
 }  // namespace airtype
