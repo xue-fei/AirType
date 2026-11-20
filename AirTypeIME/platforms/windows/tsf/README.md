@@ -146,6 +146,11 @@ airtype_tsf_probe.exe --marshal
 
 > 注意：`Destroy()` 会把 `hwnd_` 置空，此时 `Handle()` 返回 `NULL`；而
 > `PostMessageW(NULL, ...)` 是**广播**语义会返回成功。断言必须用销毁前保存的旧句柄。
+>
+> `hwnd_` 是 `std::atomic<HWND>`：`PostText` 在 MTA 线程读、`Destroy` 在 STA 线程写。
+> `PostText` 只取一次句柄——分成 `Valid()` + `Handle()` 两次读会形成 TOCTOU，
+> 中间窗口被销毁时第二次读到 `NULL`，`PostMessageW(NULL,...)` 就会把 payload
+> 指针广播给全系统顶层窗口。`Destroy` 用 `exchange(nullptr)` 原子取走句柄。
 
 ## M1 探针
 
