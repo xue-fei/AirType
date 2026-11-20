@@ -34,10 +34,10 @@ AirType 的 PC 端：接收 AirMic Node 经 Wi-Fi WebSocket 送来的语音，�
 | 共享核心语言 | **Rust + C ABI** | 跨平台不返工；`airtype-core` 不依赖 tokio / Win32，可被任意外壳复用 |
 | 首版交付 | **端到端可跑原型** | 先跑通「AirMic → PC → 输入框」，不啃 COM |
 | 音频帧协议 | **裸 PCM 16kHz/16bit/mono S16LE** | 与既有三端音频流系统一致，256kbps 局域网扛得住；codec 可插拔 |
-| Windows 注入 | **TSF in-proc COM DLL**（已实现，待注册联调）；剪贴板 + Ctrl+V 作为无头验证兜底 | 正式输入法走编辑会话，不占剪贴板、不闪字；`inject.mode` 默认 `none` |
+| Windows 注入 | **TSF in-proc COM DLL**（已实现并注册验收）；剪贴板 + Ctrl+V 作为无头验证兜底 | 正式输入法走编辑会话，不占剪贴板、不闪字；`inject.mode` 默认 `none` |
 | ASR | **本地离线 sherpa-onnx，Rust 内嵌**，可切换 `mock` / `command` / `sherpa` | 官方 Rust 绑定 crate，模型在 daemon 进程内加载，无 Python 依赖、无 HTTP 往返；默认走**流式 zipformer（fp32，中英）**，边说边出字 |
 
-> **TSF 外壳状态**：`platforms/windows/tsf/` 的 `airtype_tsf.dll` 已实现并通过进程内验证（COM 激活、隐藏窗口 marshal、编辑会话写入链路），但**尚未注册进系统**——注册要写 HKLM 且需管理员权限，因此「文字真的落进目标输入框」还没在真实应用里验收。详见 [`platforms/windows/tsf/README.md`](platforms/windows/tsf/README.md)。
+> **TSF 外壳状态**：`platforms/windows/tsf/` 的 `airtype_tsf.dll` 已实现、已用管理员 `regsvr32` 注册，并**实测文字真的落进了目标输入框**（2026-11-19，UIA `ValuePattern` 读回识别文本）。无硬件时可用 `tools/mock_airmic.py` + 探针 `--activate` / `--uia` 复现这条链路。详见 [`platforms/windows/tsf/README.md`](platforms/windows/tsf/README.md)。
 
 ---
 
@@ -308,7 +308,7 @@ python tools/bench_latency.py --wav "<2.wav 路径>" --realtime --count 5
 
 整段路径（`[streaming] enabled = false`，同一模型）实测：10.05s 音频 `asr_ms` **1050ms**，**RTF 0.104**。
 
-> 结论：**流式路径的延迟瓶颈在模型上下文窗口，不在链路**。链路开销已压到个位数毫秒。剩下的是把 TSF 外壳注册进系统做真实落字验收，以及上电实测 Wi-Fi / 采集 / 按键延迟。
+> 结论：**流式路径的延迟瓶颈在模型上下文窗口，不在链路**。链路开销已压到个位数毫秒。TSF 外壳已注册并验收真实落字（2026-11-19），剩下的是上电实测 Wi-Fi / 采集 / 按键延迟。
 
 ### 6.6 其他引擎与扩展
 
@@ -322,7 +322,7 @@ python tools/bench_latency.py --wav "<2.wav 路径>" --realtime --count 5
 
 | 平台 | 外壳技术栈 | 状态 |
 |---|---|---|
-| Windows | C++ / TSF (COM in-proc DLL) | **已实现**（`platforms/windows/tsf/`），待注册进系统验收 |
+| Windows | C++ / TSF (COM in-proc DLL) | **已实现并注册**（`platforms/windows/tsf/`），真实落字已验收 |
 | macOS | Objective-C++ / InputMethodKit | 复用同一 Rust 核心 + C ABI |
 | Linux | C++ / Fcitx5 或 IBus addon | 复用同一 Rust 核心 + C ABI |
 

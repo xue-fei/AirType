@@ -27,7 +27,7 @@ tsf/
 │   ├── airtype_tsf.def     COM 入口导出表（STDAPI 不含 dllexport，必须 .def）
 │   ├── Log.h               OutputDebugString + stderr 日志
 │   ├── TsfGuids.h/.cpp     文本服务 CLSID / profile GUID
-│   ├── TsfTypes.h          自定义消息 + AirTypePayload
+│   ├── TsfTypes.h          注册窗口消息 + AirTypePayload
 │   ├── FfiBridge.h/.cpp    airtype_ffi.dll 的加载与封装
 │   ├── ModuleUtil.h/.cpp   本模块目录 / 宿主 exe 目录解析
 │   ├── TsfString.h         UTF-8 <-> UTF-16
@@ -44,6 +44,7 @@ tsf/
 ```powershell
 powershell -ExecutionPolicy Bypass -File build.ps1              # Debug
 powershell -ExecutionPolicy Bypass -File build.ps1 -Config Release -Clean
+powershell -ExecutionPolicy Bypass -File build.ps1 -OutDir D:\side   # 产物另存
 ```
 
 产物：
@@ -58,6 +59,11 @@ powershell -ExecutionPolicy Bypass -File build.ps1 -Config Release -Clean
 > 少了它 `--dllselftest` 会报 `airtype_ffi.dll 加载失败: 126`（`ERROR_MOD_NOT_FOUND`），
 > 但 COM 激活仍然返回 `S_OK`——判断核心是否起来要看日志里的「核心已启动」，
 > 不要只看「测试通过」。
+
+> **DLL 被占用时用 `-OutDir` 旁路构建**：`build\bin` 下的 DLL 正被宿主进程加载时，
+> 链接会失败（`LNK1104: 无法打开文件 "bin\airtype_tsf.dll"`）。加 `-OutDir <目录>`
+> 把两个目标输出到别处即可完整编译链接，用于验证改动是否能过编译；产物目录可以
+> 自己选（不存在会先创建）。注意这只绕过**输出**，`-Clean` 仍会去删 `build\bin`。
 
 ## 运行期文件布局
 
@@ -353,4 +359,7 @@ airtype_stop();
   反过来的话进程退出时会 segfault（`--activate` 曾踩过，表面现象是「打印完最后一行
   日志后崩」，很难联想到是析构顺序）。
 - 目标进程加载着 `airtype_ffi.dll` / `airtype_tsf.dll` 时，构建脚本复制文件会失败
-  （只警告不中断）。要更新 DLL 先跑 `--deactivate` 让 TSF 卸载。
+  （只警告不中断），链接也会 `LNK1104`。用 `build.ps1 -OutDir` 旁路输出。
+- **`--deactivate` 不足以让已注入的 DLL 卸载**：它只停活动 profile，已经注入到进程
+  里的 DLL 实例不会立刻释放。要彻底解锁文件得重启 `explorer.exe`，而 chrome / 微信 /
+  WorkBuddy 这类常驻宿主进程只要不退出就一直持有旧 DLL。此时用 `-OutDir` 继续开发。
