@@ -13,6 +13,8 @@ pub enum ConfigError {
     Toml(#[from] toml::de::Error),
     #[error("serialize config: {0}")]
     TomlSerialize(#[from] toml::ser::Error),
+    #[error("invalid config: {0}")]
+    Invalid(String),
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -179,11 +181,43 @@ impl Default for Config {
 impl Config {
     pub fn load(path: impl AsRef<std::path::Path>) -> Result<Self, ConfigError> {
         let text = std::fs::read_to_string(path)?;
-        Ok(toml::from_str(&text)?)
+        let cfg: Self = toml::from_str(&text)?;
+        cfg.validate()?;
+        Ok(cfg)
     }
 
     pub fn from_toml(text: &str) -> Result<Self, ConfigError> {
-        Ok(toml::from_str(text)?)
+        let cfg: Self = toml::from_str(text)?;
+        cfg.validate()?;
+        Ok(cfg)
+    }
+
+    /// 校验参与除法/缓冲计算的正数字段。缺字段会走 serde 默认值（均合法），
+    /// 但显式写 0 会让 `duration_ms` / `audio_ms` / 分块计算在收到首帧时除零 panic，
+    /// 且 panic 发生在 extern "C" 边界会直接 abort 整个宿主进程。
+    fn validate(&self) -> Result<(), ConfigError> {
+        let a = &self.audio;
+        if a.sample_rate == 0 {
+            return Err(ConfigError::Invalid("audio.sample_rate must be > 0".into()));
+        }
+        if a.frame_ms == 0 {
+            return Err(ConfigError::Invalid("audio.frame_ms must be > 0".into()));
+        }
+        if a.max_utterance_ms == 0 {
+            return Err(ConfigError::Invalid("audio.max_utterance_ms must be > 0".into()));
+        }
+        if a.channels == 0 {
+            return Err(ConfigError::Invalid("audio.channels must be > 0".into()));
+        }
+        if a.bits_per_sample == 0 {
+            return Err(ConfigError::Invalid("audio.bits_per_sample must be > 0".into()));
+        }
+        if self.streaming.enabled && self.streaming.chunk_ms == 0 {
+            return Err(ConfigError::Invalid(
+                "streaming.chunk_ms must be > 0 when streaming is enabled".into(),
+            ));
+        }
+        Ok(())
     }
 
     /// 写成 TOML（设置页面保存用）。所有字段都会输出，
@@ -343,6 +377,19 @@ fn yes() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rejects_zero_sample_rate() {
+        // 除零点：audio.rs::duration_ms / pipeline.rs::audio_ms 都拿它当除数。
+        let err = Config::from_toml("[audio]\nsample_rate = 0\n").unwrap_err();
+        assert!(err.to_string().contains("sample_rate"), "{err}");
+    }
+
+    #[test]
+    fn rejects_zero_streaming_chunk_when_enabled() {
+        let err = Config::from_toml("[streaming]\nenabled = true\nchunk_ms = 0\n").unwrap_err();
+        assert!(err.to_string().contains("chunk_ms"), "{err}");
+    }
 
     #[test]
     fn empty_toml_uses_defaults() {
