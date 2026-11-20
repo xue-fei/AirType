@@ -57,7 +57,11 @@ STDMETHODIMP ReplaceEditSession::DoEditSession(TfEditCookie ec) {
             // 没有可写选区（比如焦点在按钮上），本次放弃，下次重试。
             return TF_E_NOSELECTION;
         }
-        hr = sel.range->Clone(&target);
+        // GetSelection 返回的 sel.range 调用方必须 Release；Clone 后即可释放。
+        // 用 CComPtr 接管，提前 return 或抛错时也能自动释放。
+        CComPtr<ITfRange> selected;
+        selected.Attach(sel.range);
+        hr = selected->Clone(&target);
         if (FAILED(hr)) {
             return hr;
         }
