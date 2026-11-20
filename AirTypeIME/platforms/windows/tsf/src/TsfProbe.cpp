@@ -557,8 +557,9 @@ int RunMarshalTest() {
     for (const auto& f : frames) {
         auto* payload = new airtype::AirTypePayload{f.first, f.second};
         if (PostMessageW(t.hidden.Handle(),
-                         f.second ? airtype::WM_AIRTYPE_TEXT : airtype::WM_AIRTYPE_PARTIAL, 0,
-                         reinterpret_cast<LPARAM>(payload)) == 0) {
+                         f.second ? airtype::AirTypeMessages::Get().text
+                                  : airtype::AirTypeMessages::Get().partial,
+                         0, reinterpret_cast<LPARAM>(payload)) == 0) {
             airtype::log("PostMessage 失败，丢弃该帧");
             delete payload;
         }
@@ -594,7 +595,7 @@ int RunMarshalTest() {
     SetEvent(t.quit);
     sta.join();
     const BOOL post_after = PostMessageW(
-        dead, airtype::WM_AIRTYPE_PARTIAL, 0,
+        dead, airtype::AirTypeMessages::Get().partial, 0,
         reinterpret_cast<LPARAM>(new airtype::AirTypePayload{L"x", false}));
     airtype::log("窗口销毁后 PostMessage 返回 %d（期望 0）", static_cast<int>(post_after));
     const bool lifecycle_ok = (post_after == 0) && !t.hidden.Valid();

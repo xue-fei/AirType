@@ -224,8 +224,14 @@ STDMETHODIMP TsfTextService::OnUninitDocumentMgr(ITfDocumentMgr* /*dim*/) {
 
 STDMETHODIMP TsfTextService::OnSetFocus(ITfDocumentMgr* focus, ITfDocumentMgr* /*previous*/) {
     current_doc_ = focus;
-    // 换了焦点文档，之前的写入范围不再适用。
-    ResetWrittenRange();
+    // 只有真正换了文档才丢弃写入范围。
+    // OnSetFocus 会在一次语音段内被反复触发（点击输入框、TSF 重建隐式文档、
+    // 某些应用的光标重排），如果每次都 ResetWrittenRange()，下一帧就会退化成
+    // 「往 caret 处插入」，于是同一段文字越写越长而不是原地刷新。
+    if (written_range_ && focus != written_doc_.p) {
+        airtype::log("焦点文档变化，丢弃上次写入范围");
+        ResetWrittenRange();
+    }
     FlushPending();
     return S_OK;
 }
@@ -244,7 +250,7 @@ void TsfTextService::PostText(std::wstring text, bool final) {
     if (!hidden_.Valid() || text.empty()) {
         return;
     }
-    const UINT msg = final ? WM_AIRTYPE_TEXT : WM_AIRTYPE_PARTIAL;
+    const UINT msg = final ? AirTypeMessages::Get().text : AirTypeMessages::Get().partial;
     auto* payload = new AirTypePayload{std::move(text), final};
     if (PostMessageW(hidden_.Handle(), msg, 0, reinterpret_cast<LPARAM>(payload)) == 0) {
         airtype::log("PostMessage 失败，丢弃本帧文本");

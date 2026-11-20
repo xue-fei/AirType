@@ -75,7 +75,9 @@ LRESULT CALLBACK HiddenWindow::WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
         return DefWindowProcW(hwnd, msg, wp, lp);
     }
 
-    if (msg == WM_AIRTYPE_TEXT || msg == WM_AIRTYPE_PARTIAL) {
+    const UINT text_msg = AirTypeMessages::Get().text;
+    const UINT partial_msg = AirTypeMessages::Get().partial;
+    if (msg == text_msg || msg == partial_msg) {
         auto* payload = reinterpret_cast<AirTypePayload*>(lp);
         if (payload != nullptr) {
             // 所有权转移：处理完由 handler 负责 delete。
