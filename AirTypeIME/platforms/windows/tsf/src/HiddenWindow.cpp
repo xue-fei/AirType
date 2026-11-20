@@ -57,6 +57,18 @@ void HiddenWindow::Destroy() {
     // 要么拿到 nullptr（直接丢弃），不会把消息广播出去。
     const HWND hwnd = hwnd_.exchange(nullptr, std::memory_order_relaxed);
     if (hwnd != nullptr) {
+        // PostMessage 成功后 payload 所有权归消息队列；DestroyWindow 会直接丢弃
+        // 尚未派发的消息，那些 AirTypePayload 就没人 delete 了。销毁前把本窗口
+        // 队列里残留的自定义消息取出来释放。（Destroy 在创建的 STA 线程调用，
+        // 与 WndProc 同线程，不会并发。）
+        const UINT text_msg = AirTypeMessages::Get().text;
+        const UINT partial_msg = AirTypeMessages::Get().partial;
+        MSG msg;
+        while (PeekMessageW(&msg, hwnd, 0, 0, PM_REMOVE)) {
+            if (msg.message == text_msg || msg.message == partial_msg) {
+                delete reinterpret_cast<AirTypePayload*>(msg.lParam);
+            }
+        }
         DestroyWindow(hwnd);
     }
     if (class_name_[0] != L'\0') {
