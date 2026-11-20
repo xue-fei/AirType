@@ -247,12 +247,17 @@ STDMETHODIMP TsfTextService::OnPopContext(ITfContext* /*ctx*/) {
 // --- 文本写入 ---
 
 void TsfTextService::PostText(std::wstring text, bool final) {
-    if (!hidden_.Valid() || text.empty()) {
+    // 句柄只读一次。分成 Valid() + Handle() 两次读会形成 TOCTOU：
+    // 中间 Destroy() 把 hwnd_ 置空时，PostMessageW(nullptr, ...) 是广播语义，
+    // 会把 payload 指针发给全系统的顶层窗口。
+    // 这里拿不到句柄只是丢本帧（未激活时每帧都会走到，所以不打日志）。
+    const HWND hwnd = hidden_.Handle();
+    if (hwnd == nullptr || text.empty()) {
         return;
     }
     const UINT msg = final ? AirTypeMessages::Get().text : AirTypeMessages::Get().partial;
     auto* payload = new AirTypePayload{std::move(text), final};
-    if (PostMessageW(hidden_.Handle(), msg, 0, reinterpret_cast<LPARAM>(payload)) == 0) {
+    if (PostMessageW(hwnd, msg, 0, reinterpret_cast<LPARAM>(payload)) == 0) {
         airtype::log("PostMessage 失败，丢弃本帧文本");
         delete payload;
     }

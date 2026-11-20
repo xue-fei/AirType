@@ -21,7 +21,7 @@ HiddenWindow* HiddenWindow::From(HWND hwnd) {
 }
 
 bool HiddenWindow::Create(const wchar_t* title, Handler handler) {
-    if (hwnd_ != nullptr) {
+    if (hwnd_.load(std::memory_order_relaxed) != nullptr) {
         return true;
     }
 
@@ -40,21 +40,24 @@ bool HiddenWindow::Create(const wchar_t* title, Handler handler) {
     }
 
     // 先设 GWLP_USERDATA 再创建窗口，防止窗口过程在 CreateWindowEx 返回前触发。
-    hwnd_ = CreateWindowExW(0, class_name_, title, 0, 0, 0, 0, 0, HWND_MESSAGE, nullptr,
-                            GetModuleHandleW(nullptr), this);
-    if (hwnd_ == nullptr) {
+    HWND created = CreateWindowExW(0, class_name_, title, 0, 0, 0, 0, 0, HWND_MESSAGE, nullptr,
+                                   GetModuleHandleW(nullptr), this);
+    if (created == nullptr) {
         airtype::log_hr("CreateWindowExW(隐藏窗口)", HRESULT_FROM_WIN32(GetLastError()));
         return false;
     }
-    SetWindowLongPtrW(hwnd_, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(this));
+    hwnd_.store(created, std::memory_order_relaxed);
+    SetWindowLongPtrW(created, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(this));
     handler_ = std::move(handler);
     return true;
 }
 
 void HiddenWindow::Destroy() {
-    if (hwnd_ != nullptr) {
-        DestroyWindow(hwnd_);
-        hwnd_ = nullptr;
+    // 先原子取走再销毁：并发的 PostText 要么拿到旧句柄（PostMessage 返回 0），
+    // 要么拿到 nullptr（直接丢弃），不会把消息广播出去。
+    const HWND hwnd = hwnd_.exchange(nullptr, std::memory_order_relaxed);
+    if (hwnd != nullptr) {
+        DestroyWindow(hwnd);
     }
     if (class_name_[0] != L'\0') {
         UnregisterClassW(class_name_, GetModuleHandleW(nullptr));

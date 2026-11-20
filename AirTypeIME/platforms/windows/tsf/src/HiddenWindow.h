@@ -5,6 +5,7 @@
 // 回调侧只 PostMessage，不持锁、不调用 TSF；窗口过程在创建它的 STA 线程上执行，
 // 那里才能安全地请求 ITfEditSession。
 
+#include <atomic>
 #include <functional>
 #include <windows.h>
 
@@ -26,14 +27,15 @@ public:
     bool Create(const wchar_t* title, Handler handler);
     void Destroy();
 
-    HWND Handle() const { return hwnd_; }
-    bool Valid() const { return hwnd_ != nullptr; }
+    HWND Handle() const { return hwnd_.load(std::memory_order_relaxed); }
+    bool Valid() const { return hwnd_.load(std::memory_order_relaxed) != nullptr; }
 
 private:
     static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp);
     static HiddenWindow* From(HWND hwnd);
 
-    HWND hwnd_ = nullptr;
+    // 原子：PostText 在 MTA（tokio worker）线程读，Destroy 在 STA 线程写。
+    std::atomic<HWND> hwnd_{nullptr};
     Handler handler_;
     wchar_t class_name_[64]{};
 };
