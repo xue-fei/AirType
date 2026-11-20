@@ -124,17 +124,17 @@ bool RegisterProfiles() {
         return false;
     }
 
-    // 中英文各注册一个语言配置。描述串长度按字符数传。
+    // 只注册 zh-CN 一个语言配置。
+    // AirType 做的是中英双语识别，语言判断在 ASR 模型里完成，与键盘布局的
+    // LANGID 无关；再注册 en-US 只会在输入法列表里多出一个无用的切换项。
+    // 描述串长度按字符数传（不含结尾 NUL）。
     const WCHAR* desc = L"AirType 语音输入";
     const ULONG desc_len = static_cast<ULONG>(wcslen(desc));
-    const LANGID langs[] = {0x0804, 0x0409};  // zh-CN, en-US
-    for (const LANGID lang : langs) {
-        hr = profiles->AddLanguageProfile(CLSID_AIRTYPE_TSF, lang, GUID_AIRTYPE_PROFILE, desc,
-                                          desc_len, nullptr, 0, 0);
-        if (FAILED(hr)) {
-            airtype::log_hr("AddLanguageProfile", hr);
-            return false;
-        }
+    hr = profiles->AddLanguageProfile(CLSID_AIRTYPE_TSF, 0x0804, GUID_AIRTYPE_PROFILE, desc,
+                                      desc_len, nullptr, 0, 0);
+    if (FAILED(hr)) {
+        airtype::log_hr("AddLanguageProfile(zh-CN)", hr);
+        return false;
     }
     return true;
 }
