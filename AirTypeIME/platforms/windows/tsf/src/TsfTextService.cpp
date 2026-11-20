@@ -33,13 +33,10 @@ void CALLBACK OnPartialText(const char* text, int32_t /*delete_chars*/, const ch
 TsfTextService::TsfTextService() = default;
 
 TsfTextService::~TsfTextService() {
-    // 正常情况下 Deactivate 已经清理；这里是兜底。
-    // 只要线程还 joinable 就必须回收，否则 std::thread 析构会 terminate。
-    if (core_thread_.joinable()) {
-        stopping_ = true;
-        ffi_.Stop();
-        core_thread_.join();
-    }
+    // 正常情况下 Deactivate 已经 StopCore；这里是兜底。
+    // 必须 join：后台 StartCore 持有 this 指针，不回收就 destructor 等于 UAF，
+    // 且 std::thread 析构遇到 joinable 线程会 terminate。
+    StopCore();
     hidden_.Destroy();
 }
 
@@ -184,13 +181,17 @@ bool TsfTextService::StartCore() {
 }
 
 void TsfTextService::StopCore() {
-    // 先置标志，让后台线程能在各个步骤之间及时停下；
-    // ffi_.Stop() 只发 shutdown 信号 + shutdown_background，可从 STA 线程安全调用。
     stopping_ = true;
-    ffi_.Stop();
+    // 先 join 后台线程，再调 ffi_.Stop()。
+    // StartCore 在后台线程独占 FfiBridge 的 Load/Init/SetCallback/Start 写入，
+    // 若 STA 这边并发调 Stop()（读 stop_ 等函数指针），Activate 后立刻 Deactivate
+    // 时会数据竞争（UB）。join 建立 happens-before：后台所有写入完成后 STA 才读。
+    // airtype_stop 幂等，后台路径已停过时再停一次无害。
     if (core_thread_.joinable()) {
         core_thread_.join();
     }
+    // 此时 airtype_stop 会阻塞等在途回调结束才返回，保证随后 delete this 安全。
+    ffi_.Stop();
 }
 
 std::wstring TsfTextService::ResolveConfigPath() const {
