@@ -44,9 +44,14 @@ target_link_libraries(airtype_tsf_probe PRIVATE
     UIAutomationCore
 )
 
-# 产物统一放到 build/bin，方便 build.ps1 收集。
+# 产物统一输出到 AIRTYPE_TSF_OUT_DIR（默认 <build>/bin），
+# 方便 build.ps1 收集，也允许在 DLL 被占用时改输出到旁路目录。
+if(NOT DEFINED AIRTYPE_TSF_OUT_DIR)
+    set(AIRTYPE_TSF_OUT_DIR "${CMAKE_BINARY_DIR}/bin")
+endif()
+
 set_target_properties(airtype_tsf_probe PROPERTIES
-    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
+    RUNTIME_OUTPUT_DIRECTORY "${AIRTYPE_TSF_OUT_DIR}"
 )
 
 # --- TSF 文本服务 DLL ---
@@ -81,7 +86,7 @@ target_link_libraries(airtype_tsf PRIVATE
 )
 
 set_target_properties(airtype_tsf PROPERTIES
-    LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
+    LIBRARY_OUTPUT_DIRECTORY "${AIRTYPE_TSF_OUT_DIR}"
     # 去掉 MODULE 库默认的 "lib" 前缀，产物就叫 airtype_tsf.dll
     PREFIX ""
 )

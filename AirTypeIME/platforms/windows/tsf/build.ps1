@@ -4,8 +4,9 @@
 #   powershell -ExecutionPolicy Bypass -File build.ps1                 # Debug
 #   powershell -ExecutionPolicy Bypass -File build.ps1 -Config Release
 #   powershell -ExecutionPolicy Bypass -File build.ps1 -Clean
+#   powershell -ExecutionPolicy Bypass -File build.ps1 -OutDir D:\side
 #
-# 产物：build/bin/airtype_tsf_probe.exe（后续还会产出 airtype_tsf.dll）
+# 产物：<OutDir 或 build\bin>\airtype_tsf_probe.exe + airtype_tsf.dll + airtype_ffi.dll
 #
 # 说明：这里手工拼装 INCLUDE/LIB/PATH，不调用 vcvars64.bat——
 # vcvars 内部会用 reg.exe 查注册表，在受限环境下会失败。
@@ -18,14 +19,24 @@ param(
 
     # 只重建探针 exe。目标进程加载着 airtype_tsf.dll / airtype_ffi.dll 时，
     # 链接器写不进去，用这一个选项先更新探针（例如新增 --deactivate）。
-    [switch]$ProbeOnly
+    [switch]$ProbeOnly,
+
+    # 产物输出目录，默认 build\bin。正在服役的 DLL 被目标进程锁住、
+    # 又不想重启那些进程时，用它把新产物编译到别处验证。
+    [string]$OutDir = ""
 )
 
 $ErrorActionPreference = "Stop"
 
 $Root = $PSScriptRoot
+if ($OutDir -eq "") {
+    $BinDir = Join-Path $Root "build\bin"
+} else {
+    New-Item -ItemType Directory -Force -Path $OutDir | Out-Null
+    $BinDir = (Resolve-Path -LiteralPath $OutDir).Path
+}
+# 独立 exe（探针）和 DLL 都要从同一份构建里出，避免两套 CMake 缓存互相覆盖。
 $BuildDir = Join-Path $Root "build"
-$BinDir = Join-Path $BuildDir "bin"
 
 if ($Clean -and (Test-Path $BuildDir)) {
     Write-Host "清理 $BuildDir"
@@ -110,7 +121,8 @@ New-Item -ItemType Directory -Force -Path $BuildDir | Out-Null
 & $CMake -S $Root -B $BuildDir -G Ninja `
     "-DCMAKE_BUILD_TYPE=$Config" `
     "-DCMAKE_CXX_COMPILER=$Cl" `
-    "-DCMAKE_MAKE_PROGRAM=$Ninja"
+    "-DCMAKE_MAKE_PROGRAM=$Ninja" `
+    "-DAIRTYPE_TSF_OUT_DIR=$BinDir"
 if ($LASTEXITCODE -ne 0) { throw "CMake 配置失败" }
 
 if ($ProbeOnly) {
