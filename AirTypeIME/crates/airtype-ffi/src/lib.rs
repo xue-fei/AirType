@@ -185,9 +185,16 @@ pub extern "C" fn airtype_start() -> i32 {
         store_error(&mut g, "not initialized; call airtype_init() first");
         return AIRTYPE_ERR_STATE;
     }
-    if g.shutdown.is_some() {
-        store_error(&mut g, "server is already running");
-        return AIRTYPE_ERR_STATE;
+    if let Some(tx) = g.shutdown.as_ref() {
+        // run_server 若启动即失败（端口占用等），task 结束、rx 被 drop，
+        // 但 shutdown 槽仍占着。此时 is_closed() 为 true：服务其实已死，
+        // 不清掉会让后续 start 永远误报「already running」且无法重启。
+        if tx.is_closed() {
+            g.shutdown = None;
+        } else {
+            store_error(&mut g, "server is already running");
+            return AIRTYPE_ERR_STATE;
+        }
     }
 
     let mut config = g.config.clone().unwrap();
