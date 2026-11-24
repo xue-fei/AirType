@@ -150,14 +150,41 @@ end;
 // 旧 DLL 常被「已注入的进程」锁住（TSF 外壳一旦注入就常驻），Inno 覆盖时
 // DeleteFile 会失败并导致整个安装回滚。Windows 允许重命名已加载的映像，
 // 先把它挪到 .old 让路，旧进程继续使用内存里的副本，新文件才能写入。
+//
+// .old 目标可能已被上一次占用残留占着：RenameFile 目标存在会失败，
+// 于是本次无法让路 → DeleteFile 失败 → 整个安装回滚（踩过这个坑）。
+// 所以先把旧 .old 用时间戳挪开，再让路。
+var
+  MoveAsideSeq: Integer;
+
+procedure MoveAsideOne(const Name: string);
+var
+  Base, Old, Stamp: string;
+begin
+  Base := ExpandConstant('{app}\' + Name);
+  Old := Base + '.old';
+  if FileExists(Old) then
+  begin
+    MoveAsideSeq := MoveAsideSeq + 1;
+    Stamp := Old + '.' + IntToStr(MoveAsideSeq);
+    if RenameFile(Old, Stamp) then
+      Log(Format('旧 %s.old 已挪为 .old.%d', [Name, MoveAsideSeq]))
+    else
+      Log(Format('警告：旧 %s.old 无法挪开，本次让路可能失败', [Name]));
+  end;
+  if FileExists(Base) then
+  begin
+    if RenameFile(Base, Old) then
+      Log(Format('旧 %s 被占用，已改名 %s.old', [Name, Name]))
+    else
+      Log(Format('注意：%s 改名失败（可能未被占用，交由 Inno 正常覆盖）', [Name]));
+  end;
+end;
+
 procedure MoveAsideLockedFiles;
 begin
-  if RenameFile(ExpandConstant('{app}\airtype_tsf.dll'),
-                ExpandConstant('{app}\airtype_tsf.dll.old')) then
-    Log('旧 airtype_tsf.dll 被占用，已改名 airtype_tsf.dll.old');
-  if RenameFile(ExpandConstant('{app}\airtype_ffi.dll'),
-                ExpandConstant('{app}\airtype_ffi.dll.old')) then
-    Log('旧 airtype_ffi.dll 被占用，已改名 airtype_ffi.dll.old');
+  MoveAsideOne('airtype_tsf.dll');
+  MoveAsideOne('airtype_ffi.dll');
 end;
 
 // 机器级注册（regserver）不等于「对用户启用」：还要把 profile 写进当前用户的
