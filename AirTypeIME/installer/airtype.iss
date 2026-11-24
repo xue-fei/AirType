@@ -64,6 +64,13 @@ const
   TipKey         = 'SOFTWARE\Microsoft\CTF\TIP\{2A953F76-1683-47D8-BCA4-A4C9B3171A1F}\LanguageProfile\0x00000409';
   TipKeyWow      = 'SOFTWARE\WOW6432Node\Microsoft\CTF\TIP\{2A953F76-1683-47D8-BCA4-A4C9B3171A1F}\LanguageProfile\0x00000409';
   ProfileGuid    = '{0C4CE702-4B69-4BC4-96AF-47EC0DA70E2A}';
+  MOVEFILE_DELAY_UNTIL_REBOOT = $0004;
+  MOVEFILE_REPLACE_EXISTING   = $0001;
+
+// 登记「重启后删除」。用于被注入进程占用、当场删不掉的旁路文件。
+function MoveFileEx(lpExistingFileName, lpNewFileName: string; dwFlags: DWORD):
+  Boolean;
+  external 'MoveFileExW@kernel32.dll stdcall';
 
 // 说明：不需要在 Code 段手动反注册旧 DLL。
 // [Files] 的 regserver 标志会调用新 DLL 的 DllRegisterServer，
@@ -205,6 +212,48 @@ begin
   Log(Format('probe %s -> exit %d', [Params, Code]));
 end;
 
+// 旁路文件（MoveAsideLockedFiles 改名出来的 .old / .old.N）会在 install /
+// uninstall 反复进行下越积越多（实测单目录 6 个共 60MB）。这里做一次通配清扫。
+//
+// 为什么在 ssPostInstall 也要清：卸载只删固定名 .old，带序号的 .old.N 从不处理；
+// 而安装阶段被注入进程锁住的文件此刻也删不掉。放到 ssPostInstall，此时
+// RestartExplorer 刚执行、旧 explorer 已退出，占用概率最低。
+procedure CleanupAsideFiles;
+var
+  FindRec: TFindRec;
+  Dir, SelfPath: string;
+  n: Integer;
+begin
+  Dir := ExpandConstant('{app}');
+  n := 0;
+  if FindFirst(Dir + '\*.old*', FindRec) then
+  begin
+    try
+      repeat
+        if (FindRec.Attributes and FILE_ATTRIBUTE_DIRECTORY) = 0 then
+        begin
+          SelfPath := Dir + '\' + FindRec.Name;
+          if DeleteFile(SelfPath) then
+          begin
+            n := n + 1;
+            Log(Format('已清理旁路文件：%s', [FindRec.Name]));
+          end
+          else
+          begin
+            // 删除失败（多为仍被注入进程占用）：登记到 PendingFileRenameOperations，
+            // 下次开机由系统零弹窗清除，不影响当前使用。
+            MoveFileEx(SelfPath, '', MOVEFILE_DELAY_UNTIL_REBOOT or MOVEFILE_REPLACE_EXISTING);
+            Log(Format('旁路文件暂被占用，已登记为重启后删除：%s', [FindRec.Name]));
+          end;
+        end;
+      until not FindNext(FindRec);
+    finally
+      FindClose(FindRec);
+    end;
+  end;
+  Log(Format('旁路文件清理完成，本次直接删除 %d 个。', [n]));
+end;
+
 procedure CurStepChanged(CurStep: TSetupStep);
 begin
   if CurStep = ssInstall then
@@ -219,6 +268,8 @@ begin
     // 关键一步：启用到当前用户列表，否则任务栏看不到 AirType。
     RunProbe('--enable');
     RestartExplorer;
+    // 清掉本次及历史遗留的旁路文件（删除失败 = 仍被占用，忽略即可）。
+    CleanupAsideFiles;
   end;
 end;
 
@@ -233,9 +284,9 @@ begin
   if CurUninstallStep = usPostUninstall then
   begin
     RemoveLegacyEnProfile;
-    // 清理 MoveAsideLockedFiles 留下的旁路文件（可能仍被占用，尽力而为）。
-    DeleteFile(ExpandConstant('{app}\airtype_tsf.dll.old'));
-    DeleteFile(ExpandConstant('{app}\airtype_ffi.dll.old'));
+    // 清理 MoveAsideLockedFiles 留下的旁路文件（.old / .old.N），
+    // 换用通配匹配，避免只删固定名导致 .old.N 越积越多。
+    CleanupAsideFiles;
     RestartExplorer;
   end;
 end;
