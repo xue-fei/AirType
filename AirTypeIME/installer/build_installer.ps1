@@ -68,6 +68,7 @@ $pkg = Join-Path $InstallerRoot '.pkg'
 if (Test-Path -LiteralPath $pkg) { Remove-Item -LiteralPath $pkg -Recurse -Force }
 New-Item -ItemType Directory -Force -Path $pkg | Out-Null
 New-Item -ItemType Directory -Force -Path (Join-Path $pkg 'config') | Out-Null
+New-Item -ItemType Directory -Force -Path (Join-Path $pkg 'tools') | Out-Null
 
 Copy-Item -LiteralPath (Join-Path $Stage 'airtype_tsf.dll')   -Destination $pkg -Force
 Copy-Item -LiteralPath (Join-Path $Stage 'airtype_ffi.dll')   -Destination $pkg -Force
@@ -75,6 +76,13 @@ Copy-Item -LiteralPath (Join-Path $Stage 'airtype_tsf_probe.exe') -Destination $
 
 Copy-Item -LiteralPath (Join-Path $InstallerRoot 'install.ps1') -Destination $pkg -Force
 Copy-Item -LiteralPath (Join-Path $InstallerRoot 'config\airtype.toml') -Destination (Join-Path $pkg 'config\airtype.toml') -Force
+
+# 模拟验证工具：装完后无需硬件、无需 Python 即可推音频验证上屏与悬浮图标。
+Copy-Item -LiteralPath (Join-Path $InstallerRoot 'tools\simulate_voice.ps1') -Destination (Join-Path $pkg 'tools\simulate_voice.ps1') -Force
+Copy-Item -LiteralPath (Join-Path $InstallerRoot 'tools\close_status.ps1') -Destination (Join-Path $pkg 'tools\close_status.ps1') -Force
+if (Test-Path -LiteralPath (Join-Path $InstallerRoot 'VERIFY.md')) {
+    Copy-Item -LiteralPath (Join-Path $InstallerRoot 'VERIFY.md') -Destination $pkg -Force
+}
 
 # 一键安装入口：双击即用管理员权限跑 install.ps1
 $bat = @'
@@ -124,4 +132,4 @@ if (-not $SkipBuild) { Remove-Item -LiteralPath $Stage -Recurse -Force -ErrorAct
 
 $size = [math]::Round((Get-Item -LiteralPath $ZipPath).Length / 1MB, 1)
 Log "完成：$ZipPath（$size MB）" 'Green'
-Log '包内容：airtype_tsf.dll / airtype_ffi.dll / airtype_tsf_probe.exe / install.ps1 / INSTALL.bat / UNINSTALL.bat / config\airtype.toml' 'Gray'
+Log '包内容：airtype_tsf.dll / airtype_ffi.dll / airtype_tsf_probe.exe / install.ps1 / INSTALL.bat / UNINSTALL.bat / config\airtype.toml / tools\simulate_voice.ps1 / tools\close_status.ps1 / VERIFY.md' 'Gray'
