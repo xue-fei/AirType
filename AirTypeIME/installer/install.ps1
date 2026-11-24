@@ -164,26 +164,27 @@ function Remove-LegacyEnProfile {
 function Restart-Explorer {
     Log '重启 explorer.exe 以刷新 TSF 文本服务列表...' 'Yellow'
 
-    # 本脚本以管理员（高完整性级别）运行。若从这里直接 Start-Process explorer.exe，
-    # 新进程会继承提权上下文、挂在 ps 进程树/作业对象下，命令结束时容易被一并回收 ——
-    # 这正是「explorer 关了却不回来」的根因。
+    # 本脚本以管理员（高完整性级别）运行，有两个坑要避开：
     #
-    # 修法两点：
-    #   1) 先给 Windows shell 自身 1.5s 自动拉起 explorer 的机会（原代码只等 700ms）；
-    #   2) 仍未起来时，经 cmd /c start（ShellExecute）启动，让 explorer 以普通用户
-    #      完整性级别脱离提权进程树，稳定存活。
+    #   1) 直接 Start-Process explorer.exe：新进程继承提权上下文、挂在 ps 进程树 /
+    #      作业对象下，命令结束时容易被一并回收 -> 「任务栏关了却不回来」。
+    #   2) start explorer.exe（无参数）：走 ShellExecute 的「打开主文件夹」语义，
+    #      explorer 未运行时会额外弹出一个资源管理器窗口（用户反馈的现象）。
+    #
+    # 所以用 cmd /c start "" explorer.exe：空引号对让 start 把它当窗口标题，命令
+    # 没有可打开的目标 -> cmd 退化为执行 explorer.exe 本身 = 只启动 shell 进程
+    # （任务栏/桌面），不开文件夹窗口；经 cmd 中转后 explorer 以普通用户完整性
+    # 级别脱离提权进程树。explorer 单实例，已运行时本命令不会再起第二个，幂等安全。
     Stop-Process -Name explorer -Force -ErrorAction SilentlyContinue
     Start-Sleep -Milliseconds 1500
 
-    if (-not (Get-Process -Name explorer -ErrorAction SilentlyContinue)) {
-        Start-Process -FilePath "$env:WINDIR\System32\cmd.exe" `
-                      -ArgumentList '/c start explorer.exe' `
-                      -WindowStyle Hidden
-        Start-Sleep -Milliseconds 1500
-    }
+    Start-Process -FilePath "$env:WINDIR\System32\cmd.exe" `
+                  -ArgumentList '/c start "" explorer.exe' `
+                  -WindowStyle Hidden
+    Start-Sleep -Milliseconds 1500
 
     if (Get-Process -Name explorer -ErrorAction SilentlyContinue) {
-        Log 'explorer.exe 已重启。' 'Green'
+        Log 'explorer.exe 已重启（仅恢复任务栏/桌面）。' 'Green'
     } else {
         Log 'explorer.exe 未自动恢复，请在任务管理器手动运行 explorer.exe（不影响输入法注册）。' 'DarkYellow'
     }
