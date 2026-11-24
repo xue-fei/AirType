@@ -17,6 +17,7 @@
 
 #include "FfiBridge.h"
 #include "HiddenWindow.h"
+#include "StatusWindow.h"
 
 namespace airtype {
 
@@ -59,6 +60,8 @@ private:
     bool WriteText(const std::wstring& text);
     /// 换文档/丢焦点时清空「已写入范围」，避免跨文档误替换。
     void ResetWrittenRange();
+    /// 查询插入符屏幕坐标并把状态图标移到其右侧（STA 线程）。
+    void UpdateStatusPosition();
     std::wstring ResolveConfigPath() const;
     bool StartCore();
     void StopCore();
@@ -69,6 +72,7 @@ private:
     bool active_ = false;
 
     HiddenWindow hidden_;
+    StatusWindow status_;
     FfiBridge ffi_;
 
     /// 核心初始化（加载 sherpa 模型）耗时数百毫秒，放后台线程，

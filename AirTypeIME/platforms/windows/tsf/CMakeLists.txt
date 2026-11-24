@@ -21,6 +21,7 @@ add_executable(airtype_tsf_probe
     src/TsfProbe.cpp
     src/FfiBridge.cpp
     src/HiddenWindow.cpp
+    src/StatusWindow.cpp
     src/ModuleUtil.cpp
     src/TsfGuids.cpp
 )
@@ -42,6 +43,7 @@ target_link_libraries(airtype_tsf_probe PRIVATE
     oleaut32
     uuid
     UIAutomationCore
+    gdiplus
 )
 
 # 产物统一输出到 AIRTYPE_TSF_OUT_DIR（默认 <build>/bin），
@@ -61,6 +63,7 @@ add_library(airtype_tsf MODULE
     src/TsfTextService.cpp
     src/TsfEditSession.cpp
     src/HiddenWindow.cpp
+    src/StatusWindow.cpp
     src/FfiBridge.cpp
     src/ModuleUtil.cpp
     src/TsfGuids.cpp
@@ -83,6 +86,7 @@ target_link_libraries(airtype_tsf PRIVATE
     ole32
     oleaut32
     uuid
+    gdiplus
 )
 
 set_target_properties(airtype_tsf PROPERTIES

@@ -28,6 +28,85 @@ void CALLBACK OnPartialText(const char* text, int32_t /*delete_chars*/, const ch
     }
 }
 
+// 只读查询会话：拿当前选区（折叠后即插入符）的屏幕矩形，定位状态图标。
+// GetTextExt 必须在 edit session 内调用；某些应用不给真实坐标时回退 Win32 caret。
+class CaretQuerySession : public ITfEditSession {
+public:
+    CaretQuerySession(ITfContext* ctx, TfClientId tid, StatusWindow* status)
+        : ctx_(ctx), tid_(tid), status_(status) {}
+
+    STDMETHODIMP QueryInterface(REFIID riid, void** ppv) override {
+        if (!ppv) return E_INVALIDARG;
+        if (riid == IID_IUnknown || riid == IID_ITfEditSession) {
+            *ppv = static_cast<ITfEditSession*>(this);
+            AddRef();
+            return S_OK;
+        }
+        *ppv = nullptr;
+        return E_NOINTERFACE;
+    }
+    STDMETHODIMP_(ULONG) AddRef() override { return ++ref_; }
+    STDMETHODIMP_(ULONG) Release() override {
+        const ULONG r = --ref_;
+        if (r == 0) delete this;
+        return r;
+    }
+
+    STDMETHODIMP DoEditSession(TfEditCookie ec) override {
+        RECT rc{};
+        bool have_rect = false;
+
+        // 首选 TSF 的 GetTextExt：拿插入符（选区折叠到末端）的屏幕矩形。
+        CComPtr<ITfContextView> view;
+        if (SUCCEEDED(ctx_->QueryInterface(IID_ITfContextView, reinterpret_cast<void**>(&view))) &&
+            view != nullptr) {
+            TF_SELECTION sel{};
+            ULONG fetched = 0;
+            if (SUCCEEDED(ctx_->GetSelection(ec, TF_DEFAULT_SELECTION, 1, &sel, &fetched)) &&
+                fetched > 0 && sel.range != nullptr) {
+                CComPtr<ITfRange> selected;
+                selected.Attach(sel.range);  // 接管所有权，提前 return 也自动释放
+                CComPtr<ITfRange> caret;
+                if (SUCCEEDED(selected->Clone(&caret)) &&
+                    SUCCEEDED(caret->Collapse(ec, TF_ANCHOR_END))) {
+                    BOOL clipped = FALSE;
+                    const HRESULT hr = view->GetTextExt(tid_, caret, &rc, &clipped);
+                    have_rect = SUCCEEDED(hr) && (rc.right > rc.left || rc.bottom > rc.top);
+                }
+            }
+        }
+
+        // 回退：窗口自带 caret 的应用（部分 Win32 编辑框）用 GetCaretPos。
+        if (!have_rect) {
+            POINT pt{};
+            HWND focus = GetFocus();
+            if (GetCaretPos(&pt) && (pt.x != 0 || pt.y != 0)) {
+                if (focus != nullptr) {
+                    ClientToScreen(focus, &pt);
+                }
+                rc.left = rc.right = pt.x;
+                rc.top = rc.bottom = pt.y;
+                have_rect = true;
+            }
+        }
+
+        if (have_rect) {
+            status_->FollowCaret(rc);
+        } else {
+            // 拿不到有效光标矩形（焦点不在文本区 / 应用拒绝查询）：
+            // 隐藏图标，绝不让它停在错误的旧位置或左上角。
+            status_->Hide();
+        }
+        return S_OK;
+    }
+
+private:
+    CComPtr<ITfContext> ctx_;
+    TfClientId tid_ = 0;
+    StatusWindow* status_ = nullptr;
+    LONG ref_ = 1;
+};
+
 }  // namespace
 
 TsfTextService::TsfTextService() = default;
@@ -95,6 +174,13 @@ STDMETHODIMP TsfTextService::Activate(ITfThreadMgr* ptim, TfClientId tid) {
         return E_FAIL;
     }
 
+    // 可见的悬浮状态图标（常驻，激活即显示）。失败不影响文本写入主流程。
+    if (!status_.Create()) {
+        airtype::log("状态图标创建失败，输入法仍可用");
+    }
+    // 激活时尝试定位一次：焦点文档已就绪则不必等 OnSetFocus 事件。
+    UpdateStatusPosition();
+
     // 跟踪焦点文档，用来判断已写入范围是否还有效。
     // AdviseSink 挂在 ITfSource 上（ITfThreadMgr 本身不直接暴露）。
     CComPtr<ITfSource> source;
@@ -133,6 +219,7 @@ STDMETHODIMP TsfTextService::Deactivate() {
         }
         sink_cookie_ = 0;
     }
+    status_.Destroy();
     hidden_.Destroy();
     thread_mgr_.Release();
     client_id_ = 0;
@@ -234,6 +321,7 @@ STDMETHODIMP TsfTextService::OnSetFocus(ITfDocumentMgr* focus, ITfDocumentMgr* /
         ResetWrittenRange();
     }
     FlushPending();
+    UpdateStatusPosition();
     return S_OK;
 }
 
@@ -279,11 +367,41 @@ void TsfTextService::OnPayload(AirTypePayload* payload) {
     airtype::log("%s%s %d 字符", final ? "[最终] " : "[中间] ",
                  written ? "已写入" : "未写入（已缓存，等焦点）",
                  static_cast<int>(text.size()));
+    if (written) {
+        // 写入后插入符移到新文本末尾，图标跟着更新位置。
+        UpdateStatusPosition();
+    }
 }
 
 void TsfTextService::ResetWrittenRange() {
     written_doc_.Release();
     written_range_.Release();
+}
+
+void TsfTextService::UpdateStatusPosition() {
+    if (!status_.Valid() || !thread_mgr_) {
+        return;
+    }
+    CComPtr<ITfDocumentMgr> doc = current_doc_;
+    if (!doc && FAILED(thread_mgr_->GetFocus(&doc))) {
+        return;
+    }
+    if (!doc) {
+        return;
+    }
+    CComPtr<ITfContext> ctx;
+    if (FAILED(doc->GetTop(&ctx)) || !ctx) {
+        return;
+    }
+    auto* query = new CaretQuerySession(ctx, client_id_, &status_);
+    HRESULT session_hr = E_FAIL;
+    const HRESULT hr = ctx->RequestEditSession(client_id_, query,
+                                               TF_ES_SYNC | TF_ES_READ, &session_hr);
+    query->Release();  // RequestEditSession 已 AddRef；会话结束会释放它自己那份
+    if (FAILED(hr)) {
+        // 某些应用拒绝同步只读会话，忽略：图标留在上次位置，不影响写入。
+        return;
+    }
 }
 
 void TsfTextService::FlushPending() {

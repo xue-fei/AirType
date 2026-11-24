@@ -19,12 +19,17 @@ namespace airtype {
 struct AirTypeMessages {
     UINT text = 0;
     UINT partial = 0;
+    // 卸载器向 HWND_BROADCAST 发送，让所有已加载本 DLL 的进程自毁悬浮图标。
+    // TSF 注入到每个进程后，卸载只删注册表/文件，已加载的进程收不到 Deactivate，
+    // 图标窗口会变成孤儿留在屏幕上；广播是唯一能跨进程通知到它们的手段。
+    UINT shutdown = 0;
 
     static const AirTypeMessages& Get() {
         static AirTypeMessages instance = [] {
             AirTypeMessages m;
             m.text = RegisterWindowMessageW(L"AirTypeTsf.Text");
             m.partial = RegisterWindowMessageW(L"AirTypeTsf.Partial");
+            m.shutdown = RegisterWindowMessageW(L"AirTypeTsf.Shutdown");
             return m;
         }();
         return instance;
