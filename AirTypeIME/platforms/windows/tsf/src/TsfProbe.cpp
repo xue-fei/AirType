@@ -32,6 +32,7 @@
 #include "HiddenWindow.h"
 #include "Log.h"
 #include "FfiBridge.h"
+#include "StatusWindow.h"
 #include "TsfGuids.h"
 
 #include "../include/airtype_ffi.h"
@@ -852,6 +853,91 @@ int RunShotFg(const std::string& path_utf8) {
     return SaveScreenBmp(path.c_str()) ? 0 : 1;
 }
 
+// 自绘预览窗口：画一行文字 + 假光标，用于直观验证图标跟随光标定位。
+static LRESULT CALLBACK StatusPreviewWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    if (msg == WM_PAINT) {
+        PAINTSTRUCT ps;
+        HDC dc = BeginPaint(hwnd, &ps);
+        const wchar_t* text = L"你好，这是一次语音输入测试";
+        RECT rc{};
+        GetClientRect(hwnd, &rc);
+        SetBkMode(dc, TRANSPARENT);
+        TextOutW(dc, 30, 40, text, static_cast<int>(wcslen(text)));
+        // 假光标：紧跟文字末尾。用 GetTextExtent 算末尾 X。
+        SIZE sz{};
+        GetTextExtentPoint32W(dc, text, static_cast<int>(wcslen(text)), &sz);
+        const int caret_x = 30 + sz.cx + 2;
+        MoveToEx(dc, caret_x, 40, nullptr);
+        LineTo(dc, caret_x, 40 + 22);
+        EndPaint(hwnd, &ps);
+        return 0;
+    }
+    return DefWindowProcW(hwnd, msg, wp, lp);
+}
+
+// 状态图标外观 + 定位预览：自绘文字和光标，显示图标并抓屏。
+// 只验证 StatusWindow 本身，不涉及 TSF 文本服务或 FFI。
+int RunStatusPreview(const std::string& path_utf8) {
+    airtype::log("=== 状态图标预览 ===");
+    HRESULT hr = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+    if (FAILED(hr) && hr != RPC_E_CHANGED_MODE) {
+        airtype::log_hr("CoInitializeEx(STA)", hr);
+        return 1;
+    }
+
+    WNDCLASSEXW wc{};
+    wc.cbSize = sizeof(wc);
+    wc.lpfnWndProc = StatusPreviewWndProc;
+    wc.hInstance = GetModuleHandleW(nullptr);
+    wc.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_WINDOW + 1);
+    wc.lpszClassName = L"AirTypeStatusPreview";
+    RegisterClassExW(&wc);
+
+    const int sw = GetSystemMetrics(SM_CXSCREEN);
+    const int sh = GetSystemMetrics(SM_CYSCREEN);
+    HWND host = CreateWindowExW(0, wc.lpszClassName, L"状态图标预览",
+                                WS_OVERLAPPEDWINDOW, sw / 2 - 280, sh / 2 - 120,
+                                560, 240, nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
+    ShowWindow(host, SW_SHOW);
+    UpdateWindow(host);
+
+    airtype::StatusWindow status;
+    if (!status.Create()) {
+        airtype::log("状态窗口创建失败");
+        DestroyWindow(host);
+        UnregisterClassW(wc.lpszClassName, GetModuleHandleW(nullptr));
+        CoUninitialize();
+        return 1;
+    }
+
+    // 计算假光标的屏幕坐标：和客户区绘制用同样的字体与起点。
+    RECT caret{};
+    {
+        HDC dc = GetDC(host);
+        const wchar_t* text = L"你好，这是一次语音输入测试";
+        SIZE sz{};
+        GetTextExtentPoint32W(dc, text, static_cast<int>(wcslen(text)), &sz);
+        ReleaseDC(host, dc);
+        POINT client{30 + sz.cx + 2, 40};
+        ClientToScreen(host, &client);
+        caret.left = caret.right = client.x;
+        caret.top = client.y;
+        caret.bottom = client.y + 22;
+    }
+    status.FollowCaret(caret);
+
+    Sleep(400);  // 让分层窗口完成合成
+    const std::wstring path = utf8_to_utf16(path_utf8);
+    const bool ok = SaveScreenBmp(path.c_str());
+
+    status.Destroy();
+    DestroyWindow(host);
+    UnregisterClassW(wc.lpszClassName, GetModuleHandleW(nullptr));
+    CoUninitialize();
+    airtype::log("状态图标预览截图: %s", path_utf8.c_str());
+    return ok ? 0 : 1;
+}
+
 int RunActivate(bool click) {
     airtype::log("=== 把 AirType 切成当前桌面的活动输入处理器 ===");
     HRESULT hr = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
@@ -953,6 +1039,110 @@ int RunDeactivate(DWORD flags) {
     return SUCCEEDED(hr) ? 0 : 1;
 }
 
+// ---------------------------------------------------------------------------
+// 安装器用：把 AirType 持久写入 / 移出当前用户的输入法列表。
+//
+// DllRegisterServer 只做机器级注册；要让它出现在任务栏和 Win+空格 切换列表，
+// 还必须「启用」对应 profile。这里走官方接口
+// ITfInputProcessorProfileMgr::ActivateProfile / DeactivateProfile，
+// 等价于设置里的「添加键盘」。
+//
+// 注意别和上面的 --activate/--deactivate 混用：那两个用 FORSESSION 只做
+// 运行期切换测试，不写用户配置。
+// ---------------------------------------------------------------------------
+
+// 枚举 zh-CN 下所有已注册 profile，返回目标 profile 是否带 TF_IPP_FLAG_ENABLED。
+bool ReportProfiles(ITfInputProcessorProfileMgr* mgr) {
+    CComPtr<IEnumTfInputProcessorProfiles> enum_profiles;
+    HRESULT hr = mgr->EnumProfiles(0x0804, &enum_profiles);
+    airtype::log_hr("EnumProfiles(zh-CN)", hr);
+    if (FAILED(hr) || !enum_profiles) {
+        return false;
+    }
+
+    bool found_enabled = false;
+    for (;;) {
+        TF_INPUTPROCESSORPROFILE profile{};
+        ULONG fetched = 0;
+        hr = enum_profiles->Next(1, &profile, &fetched);
+        if (hr != S_OK || fetched == 0) {
+            break;
+        }
+        wchar_t clsid[64]{};
+        wchar_t guid[64]{};
+        StringFromGUID2(profile.clsid, clsid, 64);
+        StringFromGUID2(profile.guidProfile, guid, 64);
+        const bool is_airtype =
+            (profile.clsid == CLSID_AIRTYPE_TSF && profile.guidProfile == GUID_AIRTYPE_PROFILE);
+        airtype::log("%s lang=0x%04X clsid=%s profile=%s enabled=%d active=%d",
+                     is_airtype ? "[AirType]" : "          ", profile.langid,
+                     utf16_to_utf8(clsid).c_str(), utf16_to_utf8(guid).c_str(),
+                     (profile.dwFlags & TF_IPP_FLAG_ENABLED) ? 1 : 0,
+                     (profile.dwFlags & TF_IPP_FLAG_ACTIVE) ? 1 : 0);
+        if (is_airtype && (profile.dwFlags & TF_IPP_FLAG_ENABLED)) {
+            found_enabled = true;
+        }
+    }
+    return found_enabled;
+}
+
+int RunEnable() {
+    airtype::log("=== 启用 AirType（写入当前用户输入法列表）===");
+    HRESULT hr = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+    if (FAILED(hr) && hr != RPC_E_CHANGED_MODE) {
+        airtype::log_hr("CoInitializeEx(STA)", hr);
+        return 1;
+    }
+
+    CComPtr<ITfInputProcessorProfileMgr> mgr;
+    hr = CoCreateInstance(CLSID_TF_InputProcessorProfiles, nullptr, CLSCTX_INPROC_SERVER,
+                          IID_ITfInputProcessorProfileMgr, reinterpret_cast<void**>(&mgr));
+    airtype::log_hr("CoCreateInstance(ITfInputProcessorProfileMgr)", hr);
+    if (FAILED(hr) || !mgr) {
+        CoUninitialize();
+        return 1;
+    }
+
+    hr = mgr->ActivateProfile(TF_PROFILETYPE_INPUTPROCESSOR, 0x0804, CLSID_AIRTYPE_TSF,
+                              GUID_AIRTYPE_PROFILE, nullptr, TF_IPPMF_ENABLEPROFILE);
+    airtype::log_hr("ActivateProfile(ENABLEPROFILE)", hr);
+
+    // 无论成败都枚举一次：从 dwFlags 判断系统当前对这个 profile 的看法。
+    const bool enabled = ReportProfiles(mgr);
+    mgr.Release();
+    CoUninitialize();
+    airtype::log("=== 启用%s ===", enabled ? "成功" : "未确认（见上方 profile 列表）");
+    return enabled ? 0 : 1;
+}
+
+int RunDisable() {
+    airtype::log("=== 停用 AirType（从当前用户输入法列表移除）===");
+    HRESULT hr = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+    if (FAILED(hr) && hr != RPC_E_CHANGED_MODE) {
+        airtype::log_hr("CoInitializeEx(STA)", hr);
+        return 1;
+    }
+
+    CComPtr<ITfInputProcessorProfileMgr> mgr;
+    hr = CoCreateInstance(CLSID_TF_InputProcessorProfiles, nullptr, CLSCTX_INPROC_SERVER,
+                          IID_ITfInputProcessorProfileMgr, reinterpret_cast<void**>(&mgr));
+    airtype::log_hr("CoCreateInstance(ITfInputProcessorProfileMgr)", hr);
+    if (FAILED(hr) || !mgr) {
+        CoUninitialize();
+        return 1;
+    }
+
+    hr = mgr->DeactivateProfile(TF_PROFILETYPE_INPUTPROCESSOR, 0x0804, CLSID_AIRTYPE_TSF,
+                                GUID_AIRTYPE_PROFILE, nullptr, TF_IPPMF_DISABLEPROFILE);
+    airtype::log_hr("DeactivateProfile(DISABLEPROFILE)", hr);
+
+    const bool cleared = !ReportProfiles(mgr);
+    mgr.Release();
+    CoUninitialize();
+    airtype::log("=== 停用%s ===", cleared ? "成功" : "未确认（见上方 profile 列表）");
+    return cleared ? 0 : 1;
+}
+
 void usage(const char* exe) {
     printf("用法: %s [--write <utf8 text>] [--window] [--shot <out.bmp>] [--ffi <airtype_ffi.dll>]\n",
            exe);
@@ -960,9 +1150,12 @@ void usage(const char* exe) {
     printf("      %s --dllselftest <airtype_tsf.dll>   直接激活文本服务（不注册）\n", exe);
     printf("      %s --activate [--click]  把 AirType 切进当前桌面（FORSESSION）\n", exe);
     printf("      %s --deactivate [--flags <n>]  停用 AirType，让系统回退默认键盘\n", exe);
+    printf("      %s --enable      启用 AirType（写入当前用户输入法列表，安装器用）\n", exe);
+    printf("      %s --disable     停用 AirType（从当前用户输入法列表移除，卸载器用）\n", exe);
     printf("      %s --cursor    报告鼠标位置与其下的窗口\n", exe);
     printf("      %s --uia       用 UI Automation 报告鼠标下的控件类型（只读）\n", exe);
     printf("      %s --shotfg <out.bmp>  抓整块屏幕，用于核对落字结果\n", exe);
+    printf("      %s --status-preview <out.bmp>  预览悬浮状态图标并抓屏\n", exe);
 }
 
 }  // namespace
@@ -977,12 +1170,15 @@ int main(int argc, char** argv) {
     std::string dll_selftest;
     bool activate = false;
     bool deactivate = false;
+    bool enable_profile = false;
+    bool disable_profile = false;
     bool click = false;
     // DeactivateProfile 不接受 TF_IPPMF_DONTCARECURRENTINPUTLANGUAGE（会 E_INVALIDARG）。
     DWORD deactivate_flags = 0;
     bool cursor = false;
     bool uia = false;
     std::string shotfg_path;
+    std::string status_preview_path;
 
     for (int i = 1; i < argc; ++i) {
         if (strcmp(argv[i], "--write") == 0 && i + 1 < argc) {
@@ -997,6 +1193,10 @@ int main(int argc, char** argv) {
             activate = true;
         } else if (strcmp(argv[i], "--deactivate") == 0) {
             deactivate = true;
+        } else if (strcmp(argv[i], "--enable") == 0) {
+            enable_profile = true;
+        } else if (strcmp(argv[i], "--disable") == 0) {
+            disable_profile = true;
         } else if (strcmp(argv[i], "--flags") == 0 && i + 1 < argc) {
             deactivate_flags = static_cast<DWORD>(strtoul(argv[++i], nullptr, 0));
         } else if (strcmp(argv[i], "--click") == 0) {
@@ -1007,6 +1207,8 @@ int main(int argc, char** argv) {
             uia = true;
         } else if (strcmp(argv[i], "--shotfg") == 0 && i + 1 < argc) {
             shotfg_path = argv[++i];
+        } else if (strcmp(argv[i], "--status-preview") == 0 && i + 1 < argc) {
+            status_preview_path = argv[++i];
         } else if (strcmp(argv[i], "--dllselftest") == 0 && i + 1 < argc) {
             dll_selftest = argv[++i];
         } else if (strcmp(argv[i], "--shot") == 0 && i + 1 < argc) {
@@ -1028,6 +1230,9 @@ int main(int argc, char** argv) {
     if (!shotfg_path.empty()) {
         return RunShotFg(shotfg_path);
     }
+    if (!status_preview_path.empty()) {
+        return RunStatusPreview(status_preview_path);
+    }
     if (marshal_test) {
         airtype::log("=== AirType HiddenWindow marshal 测试 ===");
         return RunMarshalTest();
@@ -1035,6 +1240,12 @@ int main(int argc, char** argv) {
     if (!dll_selftest.empty()) {
         airtype::log("=== AirType TSF DLL 自激活测试 ===");
         return RunDllSelfTest(utf8_to_utf16(dll_selftest));
+    }
+    if (enable_profile) {
+        return RunEnable();
+    }
+    if (disable_profile) {
+        return RunDisable();
     }
     if (activate) {
         return RunActivate(click);
