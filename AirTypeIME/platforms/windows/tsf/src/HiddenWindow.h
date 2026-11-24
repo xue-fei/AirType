@@ -16,6 +16,7 @@ namespace airtype {
 class HiddenWindow {
 public:
     using Handler = std::function<void(AirTypePayload*)>;
+    using CommandHandler = std::function<void()>;
 
     HiddenWindow() = default;
     ~HiddenWindow();
@@ -24,7 +25,8 @@ public:
     HiddenWindow& operator=(const HiddenWindow&) = delete;
 
     /// 创建隐藏窗口。必须在目标进程的 UI（STA）线程上调用。
-    bool Create(const wchar_t* title, Handler handler);
+    /// refresh：后台轮询线程投递 RefreshStatus 时在 STA 线程回调，用于重新定位图标。
+    bool Create(const wchar_t* title, Handler handler, CommandHandler refresh = {});
     void Destroy();
 
     HWND Handle() const { return hwnd_.load(std::memory_order_relaxed); }
@@ -37,6 +39,7 @@ private:
     // 原子：PostText 在 MTA（tokio worker）线程读，Destroy 在 STA 线程写。
     std::atomic<HWND> hwnd_{nullptr};
     Handler handler_;
+    CommandHandler refresh_;
     wchar_t class_name_[64]{};
 };
 

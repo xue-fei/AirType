@@ -55,32 +55,83 @@ public:
     STDMETHODIMP DoEditSession(TfEditCookie ec) override {
         RECT rc{};
         bool have_rect = false;
+        CComPtr<ITfRange> selected;  // 复用取到的选区，供多次回退
 
-        // 首选 TSF 的 GetTextExt：拿插入符（选区折叠到末端）的屏幕矩形。
+        // ① 首选 TSF GetTextExt：把选区折叠到末端当插入符，取屏幕矩形。
         CComPtr<ITfContextView> view;
-        if (SUCCEEDED(ctx_->QueryInterface(IID_ITfContextView, reinterpret_cast<void**>(&view))) &&
-            view != nullptr) {
-            TF_SELECTION sel{};
-            ULONG fetched = 0;
-            if (SUCCEEDED(ctx_->GetSelection(ec, TF_DEFAULT_SELECTION, 1, &sel, &fetched)) &&
-                fetched > 0 && sel.range != nullptr) {
-                CComPtr<ITfRange> selected;
-                selected.Attach(sel.range);  // 接管所有权，提前 return 也自动释放
-                CComPtr<ITfRange> caret;
-                if (SUCCEEDED(selected->Clone(&caret)) &&
-                    SUCCEEDED(caret->Collapse(ec, TF_ANCHOR_END))) {
-                    BOOL clipped = FALSE;
-                    const HRESULT hr = view->GetTextExt(tid_, caret, &rc, &clipped);
-                    have_rect = SUCCEEDED(hr) && (rc.right > rc.left || rc.bottom > rc.top);
-                }
+        const HRESULT view_hr =
+            ctx_->QueryInterface(IID_ITfContextView, reinterpret_cast<void**>(&view));
+        airtype::log("定位①: ITfContextView QI -> 0x%08X", static_cast<unsigned>(view_hr));
+
+        TF_SELECTION sel{};
+        ULONG fetched = 0;
+        const HRESULT sel_hr = ctx_->GetSelection(ec, TF_DEFAULT_SELECTION, 1, &sel, &fetched);
+        airtype::log("定位①: GetSelection -> 0x%08X fetched=%lu", static_cast<unsigned>(sel_hr),
+                     static_cast<unsigned long>(fetched));
+        if (SUCCEEDED(sel_hr) && fetched > 0 && sel.range != nullptr) {
+            selected.Attach(sel.range);  // 接管所有权，提前 return 也自动释放
+        }
+
+        if (SUCCEEDED(view_hr) && view != nullptr && selected != nullptr) {
+            CComPtr<ITfRange> caret;
+            if (SUCCEEDED(selected->Clone(&caret)) &&
+                SUCCEEDED(caret->Collapse(ec, TF_ANCHOR_END))) {
+                BOOL clipped = FALSE;
+                const HRESULT hr = view->GetTextExt(tid_, caret, &rc, &clipped);
+                have_rect = SUCCEEDED(hr) && (rc.right > rc.left || rc.bottom > rc.top);
+                airtype::log("定位①: GetTextExt(collapsed) -> 0x%08X rect=(%d,%d,%d,%d) clipped=%d",
+                             static_cast<unsigned>(hr), rc.left, rc.top, rc.right, rc.bottom,
+                             static_cast<int>(clipped));
             }
         }
 
-        // 回退：窗口自带 caret 的应用（部分 Win32 编辑框）用 GetCaretPos。
+        // ② 回退：不折叠，直接用真实选区（非空 range）取矩形。
+        //    某些应用对折叠 range 返回 TF_E_*，但对非空 range 能给出坐标。
+        if (!have_rect && SUCCEEDED(view_hr) && view != nullptr && selected != nullptr) {
+            BOOL clipped = FALSE;
+            RECT sel_rc{};
+            const HRESULT hr = view->GetTextExt(tid_, selected, &sel_rc, &clipped);
+            const bool ok = SUCCEEDED(hr) && (sel_rc.right > sel_rc.left || sel_rc.bottom > sel_rc.top);
+            airtype::log("定位②: GetTextExt(selection) -> 0x%08X rect=(%d,%d,%d,%d) clipped=%d",
+                         static_cast<unsigned>(hr), sel_rc.left, sel_rc.top, sel_rc.right,
+                         sel_rc.bottom, static_cast<int>(clipped));
+            if (ok) {
+                // 选区可能非折叠：取末端作为插入符位置。
+                rc.left = rc.right = sel_rc.right;
+                rc.top = sel_rc.top;
+                rc.bottom = sel_rc.bottom;
+                have_rect = true;
+            }
+        }
+
+        // ③ 回退：GUI 线程的 caret 矩形（对 Chromium / 现代控件有效，
+        //    GetTextExt 常在这些应用失败，但系统仍维护 GUI caret）。
+        if (!have_rect) {
+            GUITHREADINFO gti{};
+            gti.cbSize = sizeof(gti);
+            if (GetGUIThreadInfo(0, &gti) && gti.hwndCaret != nullptr) {
+                RECT cr = gti.rcCaret;
+                const bool ok = cr.right > cr.left || cr.bottom > cr.top;
+                airtype::log("定位③: GUI caret hwnd=%p rect=(%d,%d,%d,%d)",
+                             static_cast<void*>(gti.hwndCaret), cr.left, cr.top, cr.right,
+                             cr.bottom);
+                if (ok) {
+                    rc = cr;
+                    have_rect = true;
+                }
+            } else {
+                airtype::log("定位③: 无 GUI caret");
+            }
+        }
+
+        // ④ 回退：窗口自带 caret 的应用（部分 Win32 编辑框）用 GetCaretPos。
         if (!have_rect) {
             POINT pt{};
             HWND focus = GetFocus();
-            if (GetCaretPos(&pt) && (pt.x != 0 || pt.y != 0)) {
+            const bool got = GetCaretPos(&pt) != FALSE && (pt.x != 0 || pt.y != 0);
+            airtype::log("定位④: GetCaretPos -> %d pt=(%d,%d) focus=%p", static_cast<int>(got),
+                         pt.x, pt.y, static_cast<void*>(focus));
+            if (got) {
                 if (focus != nullptr) {
                     ClientToScreen(focus, &pt);
                 }
@@ -90,11 +141,36 @@ public:
             }
         }
 
+        // ⑤ 兜底：焦点窗口的客户区左上角内侧。图标「宁可位置粗略也要可见」——
+        //    光标矩形拿不到时若直接 Hide，用户会看到「完全没有图标」，无法判断
+        //    输入法是否已切换。落在焦点窗口内至少证明服务活着，随后轮询拿到精确
+        //    光标会立刻纠正位置。
+        if (!have_rect) {
+            HWND focus = GetFocus();
+            if (focus != nullptr) {
+                RECT cr{};
+                if (GetClientRect(focus, &cr)) {
+                    POINT origin{cr.left, cr.top};
+                    ClientToScreen(focus, &origin);
+                    rc.left = rc.right = origin.x + 12;
+                    rc.top = origin.y + 12;
+                    rc.bottom = origin.y + 34;
+                    have_rect = true;
+                    airtype::log("定位⑤: 窗口兜底 hwnd=%p pos=(%d,%d)", static_cast<void*>(focus),
+                                 rc.left, rc.top);
+                }
+            }
+            if (!have_rect) {
+                airtype::log("定位⑤: 无焦点窗口，隐藏图标");
+            }
+        }
+
         if (have_rect) {
+            airtype::log("定位成功 -> FollowCaret (%d,%d,%d,%d)", rc.left, rc.top, rc.right,
+                         rc.bottom);
             status_->FollowCaret(rc);
         } else {
-            // 拿不到有效光标矩形（焦点不在文本区 / 应用拒绝查询）：
-            // 隐藏图标，绝不让它停在错误的旧位置或左上角。
+            // 实在拿不到任何锚点才隐藏，绝不让它停在错误的旧位置或左上角。
             status_->Hide();
         }
         return S_OK;
@@ -116,6 +192,7 @@ TsfTextService::~TsfTextService() {
     // 必须 join：后台 StartCore 持有 this 指针，不回收就 destructor 等于 UAF，
     // 且 std::thread 析构遇到 joinable 线程会 terminate。
     StopCore();
+    StopStatusPolling();
     hidden_.Destroy();
 }
 
@@ -170,7 +247,7 @@ STDMETHODIMP TsfTextService::Activate(ITfThreadMgr* ptim, TfClientId tid) {
 
     if (!hidden_.Create(L"AirType TSF 消息窗口", [this](AirTypePayload* p) {
             this->OnPayload(p);
-        })) {
+        }, [this]() { this->UpdateStatusPosition(); })) {
         return E_FAIL;
     }
 
@@ -180,6 +257,9 @@ STDMETHODIMP TsfTextService::Activate(ITfThreadMgr* ptim, TfClientId tid) {
     }
     // 激活时尝试定位一次：焦点文档已就绪则不必等 OnSetFocus 事件。
     UpdateStatusPosition();
+    // 持续轮询兜底：Activate 常常早于焦点文档就绪，OnSetFocus 也不保证到达。
+    // 后台线程定期投递刷新消息，STA 线程收到后重试定位，直到拿到光标。
+    StartStatusPolling();
 
     // 跟踪焦点文档，用来判断已写入范围是否还有效。
     // AdviseSink 挂在 ITfSource 上（ITfThreadMgr 本身不直接暴露）。
@@ -209,6 +289,9 @@ STDMETHODIMP TsfTextService::Deactivate() {
     if (!active_) {
         return S_OK;
     }
+    // 先停定位轮询：它只 PostMessage 到隐藏窗口，必须在 hidden_.Destroy() 之前
+    // 停下并 join，否则会往已销毁的 HWND 投递（句柄可能复用，语义危险）。
+    StopStatusPolling();
     StopCore();
 
     if (thread_mgr_ && sink_cookie_ != 0) {
@@ -279,6 +362,40 @@ void TsfTextService::StopCore() {
     }
     // 此时 airtype_stop 会阻塞等在途回调结束才返回，保证随后 delete this 安全。
     ffi_.Stop();
+}
+
+void TsfTextService::StartStatusPolling() {
+    if (status_poll_thread_.joinable()) {
+        return;  // 幂等：重复 Activate 不重复起线程
+    }
+    poll_stop_ = false;
+    status_poll_thread_ = std::thread([this]() {
+        const UINT msg = AirTypeMessages::Get().refreshStatus;
+        airtype::log("状态图标定位轮询已启动（300ms）");
+        while (!poll_stop_.load(std::memory_order_acquire)) {
+            Sleep(300);
+            if (poll_stop_.load(std::memory_order_acquire)) {
+                break;
+            }
+            // 句柄只读一次：Destroy 在 STA 线程把它 exchange 成 nullptr，
+            // 这里拿到旧值 PostMessage 会失败（返回 0），不会误投递到复用句柄。
+            // 更稳的是拿到后立刻校验仍有效，但 PostMessage 到刚销毁的窗口本身
+            // 只会返回 0，无害。
+            const HWND hwnd = hidden_.Handle();
+            if (hwnd == nullptr) {
+                break;
+            }
+            PostMessageW(hwnd, msg, 0, 0);
+        }
+        airtype::log("状态图标定位轮询已停止");
+    });
+}
+
+void TsfTextService::StopStatusPolling() {
+    poll_stop_ = true;
+    if (status_poll_thread_.joinable()) {
+        status_poll_thread_.join();
+    }
 }
 
 std::wstring TsfTextService::ResolveConfigPath() const {

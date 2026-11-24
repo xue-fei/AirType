@@ -62,6 +62,10 @@ private:
     void ResetWrittenRange();
     /// 查询插入符屏幕坐标并把状态图标移到其右侧（STA 线程）。
     void UpdateStatusPosition();
+    /// 后台轮询：定期 PostMessage 到隐藏窗口，让 STA 线程重新定位图标。
+    /// 解决「Activate 时焦点未就绪 / OnSetFocus 不触发」导致图标一直隐藏的问题。
+    void StartStatusPolling();
+    void StopStatusPolling();
     std::wstring ResolveConfigPath() const;
     bool StartCore();
     void StopCore();
@@ -79,6 +83,10 @@ private:
     /// 不能堵在目标进程的 UI 线程上。
     std::thread core_thread_;
     std::atomic<bool> stopping_{false};
+
+    /// 状态图标定位轮询线程。只做 PostMessage，不碰 COM/TSF，线程安全。
+    std::thread status_poll_thread_;
+    std::atomic<bool> poll_stop_{false};
 
     /// 焦点未就绪时缓存的文本，等 OnSetFocus 补写（都在 STA 线程，无需加锁）。
     std::wstring pending_text_;

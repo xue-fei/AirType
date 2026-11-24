@@ -20,7 +20,7 @@ HiddenWindow* HiddenWindow::From(HWND hwnd) {
     return reinterpret_cast<HiddenWindow*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
 }
 
-bool HiddenWindow::Create(const wchar_t* title, Handler handler) {
+bool HiddenWindow::Create(const wchar_t* title, Handler handler, CommandHandler refresh) {
     if (hwnd_.load(std::memory_order_relaxed) != nullptr) {
         return true;
     }
@@ -49,6 +49,7 @@ bool HiddenWindow::Create(const wchar_t* title, Handler handler) {
     hwnd_.store(created, std::memory_order_relaxed);
     SetWindowLongPtrW(created, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(this));
     handler_ = std::move(handler);
+    refresh_ = std::move(refresh);
     return true;
 }
 
@@ -61,15 +62,16 @@ void HiddenWindow::Destroy() {
         // 尚未派发的消息，那些 AirTypePayload 就没人 delete 了。销毁前把本窗口
         // 队列里残留的自定义消息取出来释放。（Destroy 在创建的 STA 线程调用，
         // 与 WndProc 同线程，不会并发。）
-        const UINT text_msg = AirTypeMessages::Get().text;
-        const UINT partial_msg = AirTypeMessages::Get().partial;
-        MSG msg;
-        while (PeekMessageW(&msg, hwnd, 0, 0, PM_REMOVE)) {
-            if (msg.message == text_msg || msg.message == partial_msg) {
-                delete reinterpret_cast<AirTypePayload*>(msg.lParam);
-            }
+    const UINT text_msg = AirTypeMessages::Get().text;
+    const UINT partial_msg = AirTypeMessages::Get().partial;
+    MSG msg;
+    while (PeekMessageW(&msg, hwnd, 0, 0, PM_REMOVE)) {
+        if (msg.message == text_msg || msg.message == partial_msg) {
+            delete reinterpret_cast<AirTypePayload*>(msg.lParam);
         }
-        DestroyWindow(hwnd);
+        // RefreshStatus 无 payload（lParam=0），无需释放，直接丢弃。
+    }
+    DestroyWindow(hwnd);
     }
     if (class_name_[0] != L'\0') {
         UnregisterClassW(class_name_, GetModuleHandleW(nullptr));
@@ -101,6 +103,14 @@ LRESULT CALLBACK HiddenWindow::WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
             } else {
                 delete payload;
             }
+        }
+        return 0;
+    }
+
+    // 后台轮询线程投递的刷新命令：在 STA 线程回调，重新定位状态图标。
+    if (msg == AirTypeMessages::Get().refreshStatus) {
+        if (self->refresh_) {
+            self->refresh_();
         }
         return 0;
     }

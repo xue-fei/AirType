@@ -23,6 +23,9 @@ struct AirTypeMessages {
     // TSF 注入到每个进程后，卸载只删注册表/文件，已加载的进程收不到 Deactivate，
     // 图标窗口会变成孤儿留在屏幕上；广播是唯一能跨进程通知到它们的手段。
     UINT shutdown = 0;
+    // 后台轮询线程投递到隐藏窗口，让 STA 线程重新定位状态图标。
+    // 用注册消息而非 WM_APP+n，理由同 text/partial（防跨进程指针混淆）。
+    UINT refreshStatus = 0;
 
     static const AirTypeMessages& Get() {
         static AirTypeMessages instance = [] {
@@ -30,6 +33,7 @@ struct AirTypeMessages {
             m.text = RegisterWindowMessageW(L"AirTypeTsf.Text");
             m.partial = RegisterWindowMessageW(L"AirTypeTsf.Partial");
             m.shutdown = RegisterWindowMessageW(L"AirTypeTsf.Shutdown");
+            m.refreshStatus = RegisterWindowMessageW(L"AirTypeTsf.RefreshStatus");
             return m;
         }();
         return instance;
