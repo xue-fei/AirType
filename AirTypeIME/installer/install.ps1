@@ -161,6 +161,45 @@ function Remove-LegacyEnProfile {
     }
 }
 
+function Schedule-DeleteOnReboot([string]$Path) {
+    # 登记 PendingFileRenameOperations：下次开机由系统零弹窗删除。
+    # 用于当场删不掉的旁路文件（仍被注入进程占用）。
+    if (-not ('AirTypeMoveFileEx' -as [type])) {
+        Add-Type @'
+using System;
+using System.Runtime.InteropServices;
+public static class AirTypeMoveFileEx {
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    public static extern bool MoveFileEx(string lpExistingFileName, string lpNewFileName, uint dwFlags);
+}
+'@ -ErrorAction SilentlyContinue
+    }
+    try {
+        # MOVEFILE_DELAY_UNTIL_REBOOT(4) | MOVEFILE_REPLACE_EXISTING(1)
+        [void][AirTypeMoveFileEx]::MoveFileEx($Path, '', 5)
+    } catch {
+        Log "登记重启后删除失败（可忽略）：$Path" 'DarkYellow'
+    }
+}
+
+function Remove-AsideFiles([string]$Dir) {
+    # 清掉 MoveAsideLockedFiles 让路时改名的旁路文件（.old / .old.N）。
+    # 它们会随反复安装/卸载越积越多（实测单目录 6 个共 60MB）；卸载段只删固定名
+    # .old，带序号的 .old.N 从不处理，这里统一通配清扫。
+    # 当场删不掉的（仍被注入进程占用）登记为「重启后删除」，由系统零弹窗清除。
+    if (-not (Test-Path -LiteralPath $Dir)) { return }
+    Get-ChildItem -LiteralPath $Dir -Force -ErrorAction SilentlyContinue |
+        Where-Object { -not $_.PSIsContainer -and $_.Name -like '*.old*' } | ForEach-Object {
+            try {
+                Remove-Item -LiteralPath $_.FullName -Force -ErrorAction Stop
+                Log "已清理旁路文件：$($_.Name)" 'Green'
+            } catch {
+                Schedule-DeleteOnReboot $_.FullName
+                Log "旁路文件暂被占用，已登记为重启后删除：$($_.Name)" 'DarkYellow'
+            }
+        }
+}
+
 function Restart-Explorer {
     Log '重启 explorer.exe 以刷新 TSF 文本服务列表...' 'Yellow'
 
@@ -227,6 +266,7 @@ if ($Uninstall) {
     else { Log '未找到已注册的 DLL，跳过反注册。' 'DarkYellow' }
     Remove-LegacyEnProfile
     Remove-InstallDirFiles $InstallDir
+    Remove-AsideFiles $InstallDir
     if (Test-Path -LiteralPath $UNINSTKEY) { Remove-Item -LiteralPath $UNINSTKEY -Recurse -Force }
     # 若当初是 Inno 安装包装的，卸载项是 {CLSID}_is1（GUID 键），不是上面的
     # AirTypeTSF。Remove-InstallDirFiles 会删掉 unins000.exe 却不认这个键，
@@ -330,3 +370,5 @@ Log '  如需改麦克风地址/引擎，编辑上面的 config\airtype.toml' 'G
 
 if (-not $NoRestartExplorer) { Restart-Explorer }
 else { Log '已跳过 explorer 重启；键盘布局可能要重启 explorer 或重新登录才刷新。' 'DarkYellow' }
+
+Remove-AsideFiles $InstallDir
