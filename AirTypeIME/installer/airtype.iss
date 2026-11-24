@@ -110,23 +110,22 @@ begin
   end;
 end;
 
-// TSF 会缓存文本服务列表，必须重启 explorer 才刷新。
+// 重启 Windows shell（任务栏 + 桌面），不打开资源管理器窗口。
 //
-// 坑：安装器以管理员（高完整性级别）运行。旧代码 taskkill 后只 Sleep(800) 就
-// ShellExec('explorer.exe', ewNoWait)，新 explorer 挂在提权安装器的进程树上，
-// 安装器一退出就把它带走；只剩 Windows DCOM 自愈兜底，而自愈不保证及时 ——
-// 表现就是「explorer 关了却没重启」。实测日志里 explorer 启动与 Setup 退出只差
-// 6ms，纯属侥幸；有一次自愈没接管，任务栏就空了。
+// 为什么不能直接 Start-Process/ShellExec explorer.exe：
+//   1) 安装器以管理员（High IL）运行，直接启动的 explorer 会挂在安装器进程树上，
+//      安装器一退出就把它一起回收 -> 表现为「关了任务栏却不回来」；
+//   2) `start explorer.exe`（无参数）走 ShellExecute 的「打开主文件夹」语义，
+//      explorer 未运行时会额外弹出一个资源管理器窗口。
 //
-// 修法（与 install.ps1 的 Restart-Explorer 一致）：
-//   1) 先等 1.5s，给 Windows shell 自身经 DCOM 自动拉起 explorer 的机会；
-//   2) 再经 cmd /c start（ShellExecute）启动一次，让 explorer 以普通完整性级别
-//      脱离提权进程树，稳定存活；
-//   3) 延时后再补一次，双保险。
+// 所以用 cmd /c start "" explorer.exe：空引号对让 start 把它当窗口标题，命令没有
+// 可打开的目标 -> cmd 退化为执行 explorer.exe 本身 = 只启动 shell 进程。
+// 经 cmd 中转后 explorer 以普通用户完整性级别脱离提权进程树；explorer 单实例，
+// 已运行时本命令不会再起第二个，因此无条件执行一次即幂等安全。
 //
-// 不用 FindWindowByClassName 探测任务栏：安装器是 High IL、explorer 是 Medium IL，
-// UIPI 会阻止提权进程枚举低完整性窗口，探测恒为 0（实测误报）。改为幂等策略：
-// explorer.exe 是单实例，已运行时 start 不会再起第二个，因此重复调用安全。
+// 也不用 FindWindow/tasklist 探测任务栏：安装器是 High IL，UIPI 挡住对低完整性
+// 窗口的枚举（FindWindow 恒 0）；tasklist 按 imagename 过滤在无匹配时退出码同样
+// 为 0（实测判定不可靠）。探测只会误报，故去掉。
 procedure RestartExplorer;
 var
   Code: Integer;
@@ -134,51 +133,54 @@ begin
   Log('RestartExplorer: 结束 explorer.exe 并刷新 TSF 缓存...');
   Exec('taskkill.exe', '/f /im explorer.exe', '', SW_HIDE, ewWaitUntilTerminated, Code);
 
-  // 步骤 1：给 Windows 自愈留时间（原代码只等 800ms）。
+  // 给 Windows shell 自身经 DCOM 自动拉起 explorer 的时间（原代码只等 800ms）。
   Sleep(1500);
 
-  // 步骤 2：经 cmd /c start 脱离提权进程树启动（幂等，已运行则不会再起）。
-  Log('RestartExplorer: 经 cmd /c start 拉起 explorer.exe...');
-  Exec(ExpandConstant('{cmd}'), '/c start explorer.exe', '', SW_HIDE, ewNoWait, Code);
-
-  // 步骤 3：延时后补一次，防止首次 start 恰在自愈中途被忽略。
+  Log('RestartExplorer: 恢复 Windows shell（仅任务栏/桌面，不打开文件夹窗口）...');
+  Exec(ExpandConstant('{cmd}'), '/c start "" explorer.exe', '', SW_HIDE, ewNoWait, Code);
   Sleep(1500);
-  Exec(ExpandConstant('{cmd}'), '/c start explorer.exe', '', SW_HIDE, ewNoWait, Code);
-  Log('RestartExplorer: 已发出 explorer.exe 启动请求（单实例，重复调用安全）。');
+
+  Log('RestartExplorer: 已发出 shell 启动请求（单实例，重复调用安全）。');
 end;
 
 // 旧 DLL 常被「已注入的进程」锁住（TSF 外壳一旦注入就常驻），Inno 覆盖时
 // DeleteFile 会失败并导致整个安装回滚。Windows 允许重命名已加载的映像，
-// 先把它挪到 .old 让路，旧进程继续使用内存里的副本，新文件才能写入。
+// 先把它挪走让路，旧进程继续使用内存里的副本，新文件才能写入。
 //
-// .old 目标可能已被上一次占用残留占着：RenameFile 目标存在会失败，
-// 于是本次无法让路 → DeleteFile 失败 → 整个安装回滚（踩过这个坑）。
-// 所以先把旧 .old 用时间戳挪开，再让路。
+// 踩过的坑：早期实现先把已存在的 .old 挪成 .old.<序号> 再让路，但那个旧 .old
+// 往往同样被占用 / 挪不动，于是 RenameFile(Base, .old) 因目标已存在而失败
+// -> Base 没让开 -> DeleteFile 失败 -> 整个安装回滚。改为不依赖「挪开旧
+// .old」，直接把 Base 改名为一个全新的唯一名字（.old.<递增序号>）。
 var
   MoveAsideSeq: Integer;
 
 procedure MoveAsideOne(const Name: string);
 var
-  Base, Old, Stamp: string;
+  Base, Target: string;
+  i: Integer;
+  moved: Boolean;
 begin
-  Base := ExpandConstant('{app}\' + Name);
-  Old := Base + '.old';
-  if FileExists(Old) then
+  Base := ExpandConstant('{app}\\' + Name);
+  if not FileExists(Base) then
+    Exit;
+
+  moved := False;
+  for i := 1 to 50 do
   begin
     MoveAsideSeq := MoveAsideSeq + 1;
-    Stamp := Old + '.' + IntToStr(MoveAsideSeq);
-    if RenameFile(Old, Stamp) then
-      Log(Format('旧 %s.old 已挪为 .old.%d', [Name, MoveAsideSeq]))
-    else
-      Log(Format('警告：旧 %s.old 无法挪开，本次让路可能失败', [Name]));
+    Target := Format('%s.old.%d', [Base, MoveAsideSeq]);
+    if FileExists(Target) then
+      Continue;
+    if RenameFile(Base, Target) then
+    begin
+      Log(Format('%s 被占用，已改名 %s', [Name, ExtractFileName(Target)]));
+      moved := True;
+      Break;
+    end;
   end;
-  if FileExists(Base) then
-  begin
-    if RenameFile(Base, Old) then
-      Log(Format('旧 %s 被占用，已改名 %s.old', [Name, Name]))
-    else
-      Log(Format('注意：%s 改名失败（可能未被占用，交由 Inno 正常覆盖）', [Name]));
-  end;
+
+  if not moved then
+    Log(Format('警告：%s 改名失败，本次覆盖可能失败（交由 Inno 处理）', [Name]));
 end;
 
 procedure MoveAsideLockedFiles;
