@@ -163,10 +163,29 @@ function Remove-LegacyEnProfile {
 
 function Restart-Explorer {
     Log '重启 explorer.exe 以刷新 TSF 文本服务列表...' 'Yellow'
+
+    # 本脚本以管理员（高完整性级别）运行。若从这里直接 Start-Process explorer.exe，
+    # 新进程会继承提权上下文、挂在 ps 进程树/作业对象下，命令结束时容易被一并回收 ——
+    # 这正是「explorer 关了却不回来」的根因。
+    #
+    # 修法两点：
+    #   1) 先给 Windows shell 自身 1.5s 自动拉起 explorer 的机会（原代码只等 700ms）；
+    #   2) 仍未起来时，经 cmd /c start（ShellExecute）启动，让 explorer 以普通用户
+    #      完整性级别脱离提权进程树，稳定存活。
     Stop-Process -Name explorer -Force -ErrorAction SilentlyContinue
-    Start-Sleep -Milliseconds 700
+    Start-Sleep -Milliseconds 1500
+
     if (-not (Get-Process -Name explorer -ErrorAction SilentlyContinue)) {
-        Start-Process explorer.exe
+        Start-Process -FilePath "$env:WINDIR\System32\cmd.exe" `
+                      -ArgumentList '/c start explorer.exe' `
+                      -WindowStyle Hidden
+        Start-Sleep -Milliseconds 1500
+    }
+
+    if (Get-Process -Name explorer -ErrorAction SilentlyContinue) {
+        Log 'explorer.exe 已重启。' 'Green'
+    } else {
+        Log 'explorer.exe 未自动恢复，请在任务管理器手动运行 explorer.exe（不影响输入法注册）。' 'DarkYellow'
     }
 }
 
@@ -191,6 +210,15 @@ function Remove-InstallDirFiles([string]$Dir) {
 # ---------- 3. 卸载 ----------
 if ($Uninstall) {
     Log '开始卸载 AirType TSF...' 'Cyan'
+
+    # 先广播关闭所有进程里的悬浮图标：TSF 注入到每个进程，反注册/删 DLL
+    # 不会通知已加载的进程 Deactivate，图标会变成孤儿留在屏幕上。
+    $closeTool = Join-Path $PSScriptRoot 'tools\close_status.ps1'
+    if (Test-Path -LiteralPath $closeTool) {
+        try { & $closeTool -Quiet; Log '已通知各进程关闭悬浮图标。' 'Green' }
+        catch { Log "关闭悬浮图标失败（可忽略）：$($_.Exception.Message)" 'DarkYellow' }
+    }
+
     $registered = Get-RegisteredDll
     $targetDll = if ($registered -and (Test-Path -LiteralPath $registered)) { $registered }
                  else { Join-Path $InstallDir 'airtype_tsf.dll' }
@@ -199,6 +227,16 @@ if ($Uninstall) {
     Remove-LegacyEnProfile
     Remove-InstallDirFiles $InstallDir
     if (Test-Path -LiteralPath $UNINSTKEY) { Remove-Item -LiteralPath $UNINSTKEY -Recurse -Force }
+    # 若当初是 Inno 安装包装的，卸载项是 {CLSID}_is1（GUID 键），不是上面的
+    # AirTypeTSF。Remove-InstallDirFiles 会删掉 unins000.exe 却不认这个键，
+    # 于是「应用和功能」里留下指向空路径的僵尸项。这里一并清掉。
+    $innoKey = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\${CLSID}_is1"
+    if (Test-Path -LiteralPath $innoKey) {
+        try {
+            Remove-Item -LiteralPath $innoKey -Recurse -Force
+            Log '已清除 Inno 卸载项（{CLSID}_is1）。' 'Green'
+        } catch { Log "清除 Inno 卸载项失败（可忽略）：$($_.Exception.Message)" 'DarkYellow' }
+    }
     Log '卸载完成。' 'Green'
     if (-not $NoRestartExplorer) { Restart-Explorer }
     exit 0
@@ -210,6 +248,8 @@ $srcTsf   = Join-Path $Source 'airtype_tsf.dll'
 $srcFfi   = Join-Path $Source 'airtype_ffi.dll'
 $srcProbe = Join-Path $Source 'airtype_tsf_probe.exe'
 $srcCfg   = Join-Path $Source 'config\airtype.toml'
+$srcTools = Join-Path $Source 'tools'
+$srcVerify = Join-Path $Source 'VERIFY.md'
 
 foreach ($f in @($srcTsf, $srcFfi, $srcProbe)) {
     if (-not (Test-Path -LiteralPath $f)) {
@@ -257,6 +297,13 @@ if (Test-Path -LiteralPath $srcCfg) {
     } else {
         Log '保留现有 config\airtype.toml（未覆盖）' 'DarkYellow'
     }
+}
+# 模拟验证工具 + 验证说明也装进去，用户装完无需硬件即可自测
+if (Test-Path -LiteralPath $srcTools) {
+    Copy-Item -LiteralPath $srcTools -Destination (Join-Path $InstallDir 'tools') -Recurse -Force
+}
+if (Test-Path -LiteralPath $srcVerify) {
+    Copy-Item -LiteralPath $srcVerify -Destination (Join-Path $InstallDir 'VERIFY.md') -Force
 }
 # 把安装器自身也放进安装目录，供日后更新 / 从“应用和功能”卸载
 Copy-Item -LiteralPath $PSCommandPath -Destination (Join-Path $InstallDir 'install.ps1') -Force
