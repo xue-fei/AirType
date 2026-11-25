@@ -5,6 +5,7 @@
 #include "Log.h"
 #include "ModuleUtil.h"
 #include "TsfEditSession.h"
+#include "TsfGuids.h"
 #include "TsfString.h"
 
 namespace airtype {
@@ -28,12 +29,87 @@ void CALLBACK OnPartialText(const char* text, int32_t /*delete_chars*/, const ch
     }
 }
 
+// 本进程是否是当前前台进程。
+//
+// TSF 的激活状态按线程保留：别的程序里曾经用过 AirType 的线程，即使用户
+// 已把前台切到其它输入法，也可能残留一个激活实例，图标就会一直挂着。
+// 只依赖本进程收到 Deactivate 收不干净，所以用前台进程做统一裁决。
+bool IsCurrentProcessForeground() {
+    HWND fg = GetForegroundWindow();
+    if (fg == nullptr) {
+        return false;
+    }
+    DWORD pid = 0;
+    GetWindowThreadProcessId(fg, &pid);
+    return pid != 0 && pid == GetCurrentProcessId();
+}
+
+// 查询「当前活动键盘输入法」是否仍是 AirType，带进程级结果缓存。
+//
+// 为什么需要它：TSF 的激活状态是**按线程**维护的，切到其他输入法时，
+// 本进程这个 TIP 实例不一定会收到 Deactivate（典型：后台进程/资源管理器里
+// 残留的实例），图标就会一直挂在屏幕上。用官方接口做会话级兜底判断。
+// 查询失败时返回 true（保持现状），宁可偶发多显示也不误隐藏。
+//
+// 为什么缓存：这是**高频路径**（跟随轮询每 40ms 一次）。原实现每次都新建
+// ITfInputProcessorProfileMgr COM 对象再查一次，实测是持续的开销源。
+// 这里缓存 COM 实例与最近一次结果，kActiveProbeIntervalMs 内直接复用；
+// 只有缓存过期才真正查询。切换输入法本来就有约 250ms 的系统级延迟，
+// 这个粒度对「切走就收」完全够用。
+constexpr DWORD kActiveProbeIntervalMs = 250;
+
+bool IsAirTypeActiveKeyboard() {
+    static CComPtr<ITfInputProcessorProfileMgr> mgr;
+    static bool have_cached = false;
+    static bool cached_active = true;
+    static DWORD last_tick = 0;
+
+    const DWORD now = GetTickCount();
+    const bool expired =
+        !have_cached || (now - last_tick) >= kActiveProbeIntervalMs || now < last_tick;
+    if (!expired) {
+        return cached_active;
+    }
+
+    // 只创建一次；后续沿用同一实例（COM 对象本身线程亲和，但本函数只在
+    // STA 线程调用，语义安全）。
+    if (!mgr) {
+        const HRESULT ci = CoCreateInstance(
+            CLSID_TF_InputProcessorProfiles, nullptr, CLSCTX_INPROC_SERVER,
+            IID_ITfInputProcessorProfileMgr, reinterpret_cast<void**>(&mgr));
+        if (FAILED(ci) || !mgr) {
+            return true;  // 拿不到管理器：放行，不要因为查不了就把图标藏掉
+        }
+    }
+
+    bool active = true;
+    TF_INPUTPROCESSORPROFILE profile{};
+    const HRESULT hr = mgr->GetActiveProfile(GUID_TFCAT_TIP_KEYBOARD, &profile);
+    if (SUCCEEDED(hr)) {
+        active = profile.clsid == CLSID_AIRTYPE_TSF && profile.guidProfile == GUID_AIRTYPE_PROFILE;
+    } else {
+        // 查询失败：不清缓存、不改结果，下一次再试（避免抖动）。
+        return cached_active;
+    }
+
+    cached_active = active;
+    have_cached = true;
+    last_tick = now;
+    return active;
+}
+
 // 只读查询会话：拿当前选区（折叠后即插入符）的屏幕矩形，定位状态图标。
 // GetTextExt 必须在 edit session 内调用；某些应用不给真实坐标时回退 Win32 caret。
+//
+// 为什么是异步会话（TF_ES_ASYNC）：原实现用 TF_ES_SYNC，会在**目标进程的 UI
+// 线程上原地等待** TSF 内部发编辑凭证。应用忙、上下文被锁、或正在滚动重排时，
+// 这一等就是几十到几百毫秒——表现为悬浮图标"卡住不动、然后猛地跳一下"。
+// 改异步后 DoEditSession 仍在请求线程（STA）执行，能直接更新分层窗口，但不再
+// 阻塞调用方。配合 StatusWindow::generation 丢弃过期结果，避免旧坐标晚到把图标拖回去。
 class CaretQuerySession : public ITfEditSession {
 public:
-    CaretQuerySession(ITfContext* ctx, TfClientId tid, StatusWindow* status)
-        : ctx_(ctx), tid_(tid), status_(status) {}
+    CaretQuerySession(ITfContext* ctx, TfClientId tid, StatusWindow* status, LONG generation)
+        : ctx_(ctx), tid_(tid), status_(status), generation_(generation) {}
 
     STDMETHODIMP QueryInterface(REFIID riid, void** ppv) override {
         if (!ppv) return E_INVALIDARG;
@@ -52,7 +128,14 @@ public:
         return r;
     }
 
+    // 所有方法只在 STA 线程执行：RequestEditSession 由 STA 发起，
+    // 异步回调也由 TSF 投递回同一 STA 消息循环，不存在跨线程访问 status_。
     STDMETHODIMP DoEditSession(TfEditCookie ec) override {
+        // 代次已过期：这帧是排队期间被更新的旧请求，丢弃，别把图标拖回旧位置。
+        if (generation_ != status_->generation.load(std::memory_order_acquire)) {
+            return S_OK;
+        }
+
         RECT rc{};
         bool have_rect = false;
         CComPtr<ITfRange> selected;  // 复用取到的选区，供多次回退
@@ -61,13 +144,10 @@ public:
         CComPtr<ITfContextView> view;
         const HRESULT view_hr =
             ctx_->QueryInterface(IID_ITfContextView, reinterpret_cast<void**>(&view));
-        airtype::log("定位①: ITfContextView QI -> 0x%08X", static_cast<unsigned>(view_hr));
 
         TF_SELECTION sel{};
         ULONG fetched = 0;
         const HRESULT sel_hr = ctx_->GetSelection(ec, TF_DEFAULT_SELECTION, 1, &sel, &fetched);
-        airtype::log("定位①: GetSelection -> 0x%08X fetched=%lu", static_cast<unsigned>(sel_hr),
-                     static_cast<unsigned long>(fetched));
         if (SUCCEEDED(sel_hr) && fetched > 0 && sel.range != nullptr) {
             selected.Attach(sel.range);  // 接管所有权，提前 return 也自动释放
         }
@@ -79,9 +159,6 @@ public:
                 BOOL clipped = FALSE;
                 const HRESULT hr = view->GetTextExt(tid_, caret, &rc, &clipped);
                 have_rect = SUCCEEDED(hr) && (rc.right > rc.left || rc.bottom > rc.top);
-                airtype::log("定位①: GetTextExt(collapsed) -> 0x%08X rect=(%d,%d,%d,%d) clipped=%d",
-                             static_cast<unsigned>(hr), rc.left, rc.top, rc.right, rc.bottom,
-                             static_cast<int>(clipped));
             }
         }
 
@@ -92,9 +169,6 @@ public:
             RECT sel_rc{};
             const HRESULT hr = view->GetTextExt(tid_, selected, &sel_rc, &clipped);
             const bool ok = SUCCEEDED(hr) && (sel_rc.right > sel_rc.left || sel_rc.bottom > sel_rc.top);
-            airtype::log("定位②: GetTextExt(selection) -> 0x%08X rect=(%d,%d,%d,%d) clipped=%d",
-                         static_cast<unsigned>(hr), sel_rc.left, sel_rc.top, sel_rc.right,
-                         sel_rc.bottom, static_cast<int>(clipped));
             if (ok) {
                 // 选区可能非折叠：取末端作为插入符位置。
                 rc.left = rc.right = sel_rc.right;
@@ -110,17 +184,11 @@ public:
             GUITHREADINFO gti{};
             gti.cbSize = sizeof(gti);
             if (GetGUIThreadInfo(0, &gti) && gti.hwndCaret != nullptr) {
-                RECT cr = gti.rcCaret;
-                const bool ok = cr.right > cr.left || cr.bottom > cr.top;
-                airtype::log("定位③: GUI caret hwnd=%p rect=(%d,%d,%d,%d)",
-                             static_cast<void*>(gti.hwndCaret), cr.left, cr.top, cr.right,
-                             cr.bottom);
-                if (ok) {
+                const RECT cr = gti.rcCaret;
+                if (cr.right > cr.left || cr.bottom > cr.top) {
                     rc = cr;
                     have_rect = true;
                 }
-            } else {
-                airtype::log("定位③: 无 GUI caret");
             }
         }
 
@@ -129,8 +197,6 @@ public:
             POINT pt{};
             HWND focus = GetFocus();
             const bool got = GetCaretPos(&pt) != FALSE && (pt.x != 0 || pt.y != 0);
-            airtype::log("定位④: GetCaretPos -> %d pt=(%d,%d) focus=%p", static_cast<int>(got),
-                         pt.x, pt.y, static_cast<void*>(focus));
             if (got) {
                 if (focus != nullptr) {
                     ClientToScreen(focus, &pt);
@@ -156,18 +222,11 @@ public:
                     rc.top = origin.y + 12;
                     rc.bottom = origin.y + 34;
                     have_rect = true;
-                    airtype::log("定位⑤: 窗口兜底 hwnd=%p pos=(%d,%d)", static_cast<void*>(focus),
-                                 rc.left, rc.top);
                 }
-            }
-            if (!have_rect) {
-                airtype::log("定位⑤: 无焦点窗口，隐藏图标");
             }
         }
 
         if (have_rect) {
-            airtype::log("定位成功 -> FollowCaret (%d,%d,%d,%d)", rc.left, rc.top, rc.right,
-                         rc.bottom);
             status_->FollowCaret(rc);
         } else {
             // 实在拿不到任何锚点才隐藏，绝不让它停在错误的旧位置或左上角。
@@ -180,6 +239,7 @@ private:
     CComPtr<ITfContext> ctx_;
     TfClientId tid_ = 0;
     StatusWindow* status_ = nullptr;
+    LONG generation_ = 0;
     LONG ref_ = 1;
 };
 
@@ -364,6 +424,11 @@ void TsfTextService::StopCore() {
     ffi_.Stop();
 }
 
+// 跟随轮询间隔。原来是 300ms——输入框移动/光标跳动时，图标最多要等 300ms 才
+// 更新一次，视觉上就是"拖着走、一顿一顿"。40ms（25Hz）接近人眼连续感，
+// 配合 StatusWindow 的坐标去重与异步编辑会话，静止时几乎零开销。
+constexpr DWORD kStatusPollIntervalMs = 40;
+
 void TsfTextService::StartStatusPolling() {
     if (status_poll_thread_.joinable()) {
         return;  // 幂等：重复 Activate 不重复起线程
@@ -371,9 +436,9 @@ void TsfTextService::StartStatusPolling() {
     poll_stop_ = false;
     status_poll_thread_ = std::thread([this]() {
         const UINT msg = AirTypeMessages::Get().refreshStatus;
-        airtype::log("状态图标定位轮询已启动（300ms）");
+        airtype::log("状态图标定位轮询已启动（%ums）", static_cast<unsigned>(kStatusPollIntervalMs));
         while (!poll_stop_.load(std::memory_order_acquire)) {
-            Sleep(300);
+            Sleep(kStatusPollIntervalMs);
             if (poll_stop_.load(std::memory_order_acquire)) {
                 break;
             }
@@ -499,6 +564,17 @@ void TsfTextService::UpdateStatusPosition() {
     if (!status_.Valid() || !thread_mgr_) {
         return;
     }
+    // 别的程序里残留的激活实例：本进程不是前台进程时图标一律收起。
+    if (!IsCurrentProcessForeground()) {
+        status_.Hide();
+        return;
+    }
+    // 已被切到其他输入法：即便本进程没收到 Deactivate，也要把图标收起来。
+    // Activate 瞬间可能还没登记成 active，隐藏后由轮询在下一拍恢复显示。
+    if (!IsAirTypeActiveKeyboard()) {
+        status_.Hide();
+        return;
+    }
     CComPtr<ITfDocumentMgr> doc = current_doc_;
     if (!doc && FAILED(thread_mgr_->GetFocus(&doc))) {
         return;
@@ -510,13 +586,20 @@ void TsfTextService::UpdateStatusPosition() {
     if (FAILED(doc->GetTop(&ctx)) || !ctx) {
         return;
     }
-    auto* query = new CaretQuerySession(ctx, client_id_, &status_);
+    // 递增代次：排队期间若有更新的请求发出，这次查询回来时会被丢弃，
+    // 避免旧坐标晚到把图标拖回上一帧的位置（异步化后必须配的代次闸门）。
+    const LONG generation = ++status_.generation;
+
+    auto* query = new CaretQuerySession(ctx, client_id_, &status_, generation);
     HRESULT session_hr = E_FAIL;
+    // TF_ES_ASYNC：不阻塞目标进程 UI 线程。这是"输入框移动时跟随卡顿"的主因修复——
+    // 原来的 TF_ES_SYNC 会在 UI 线程上原地等 TSF 发编辑凭证，应用忙/滚动重排时
+    // 一卡就是几十到几百毫秒，图标表现为"卡住不动然后猛地跳一下"。
     const HRESULT hr = ctx->RequestEditSession(client_id_, query,
-                                               TF_ES_SYNC | TF_ES_READ, &session_hr);
+                                               TF_ES_ASYNC | TF_ES_READ, &session_hr);
     query->Release();  // RequestEditSession 已 AddRef；会话结束会释放它自己那份
     if (FAILED(hr)) {
-        // 某些应用拒绝同步只读会话，忽略：图标留在上次位置，不影响写入。
+        // 某些应用拒绝只读会话，忽略：图标留在上次位置，不影响写入。
         return;
     }
 }

@@ -138,9 +138,12 @@ void StatusWindow::Render() {
     Pen border(Color(255, 150, 200, 240), 1);
     g.DrawPath(&border, &bubble);
 
-    // 麦克风图标（白色），位于左侧
+    // 麦克风图标（白色），位于左侧。
+    // my 让图形（帽头 y=my..my+14、托架到 my+19、底座 my+23）的整体中心
+    // 落在胶囊中线 18 附近：my=7 时图形占 7..30，中心 18.5，与文字基线一致
+    // （早先 my=9 时占 9..32、中心 20.5，视觉上明显偏下）。
     const int mx = 7;
-    const int my = 9;
+    const int my = 7;
     SolidBrush white(Color(255, 255, 255, 255));
     Pen whitePen(Color(255, 255, 255, 255), 1.8f);
     whitePen.SetStartCap(LineCapRound);
@@ -194,8 +197,14 @@ void StatusWindow::FollowCaret(const RECT& caret) {
         return;
     }
     int x = caret.right + kCaretGap;
-    // 垂直居中于 caret 行
-    int y = caret.top - (height_ - (caret.bottom - caret.top)) / 2;
+    // 垂直居中于 caret 行。部分应用（Chromium/自绘控件）对折叠 range 的
+    // GetTextExt 会返回高度≈0 的退化矩形，直接套公式会让图标中心比光标低
+    // 几乎整个图标高度。给行高设下限（约一个 11pt 字的身位），保证对齐合理。
+    int caret_h = caret.bottom - caret.top;
+    if (caret_h < 18) {
+        caret_h = 18;
+    }
+    int y = caret.top + (caret_h - height_) / 2;
 
     // 越过屏幕右边界时翻到插入符左侧
     const int screen_w = GetSystemMetrics(SM_CXVIRTUALSCREEN);
@@ -209,6 +218,14 @@ void StatusWindow::FollowCaret(const RECT& caret) {
     if (y < GetSystemMetrics(SM_YVIRTUALSCREEN)) {
         y = GetSystemMetrics(SM_YVIRTUALSCREEN);
     }
+
+    // 位置没变就别动窗口。跟随轮询现在跑到 25Hz，若每拍都 SetWindowPos，
+    // 光标静止时也在持续触发分层窗口位置更新与桌面合成，纯属白烧。
+    if (x == last_x_ && y == last_y_) {
+        return;
+    }
+    last_x_ = x;
+    last_y_ = y;
 
     SetWindowPos(hwnd_, nullptr, x, y, 0, 0,
                  SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_SHOWWINDOW);

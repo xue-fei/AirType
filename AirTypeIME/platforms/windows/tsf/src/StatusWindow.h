@@ -6,6 +6,8 @@
 // 只做线程 marshal）；StatusWindow 是真正绘制在屏幕上的 WS_EX_LAYERED popup，
 // 鼠标穿透、不抢焦点、置顶。所有方法只能在创建它的 STA 线程调用。
 
+#include <atomic>
+#include <climits>
 #include <windows.h>
 
 namespace airtype {
@@ -32,6 +34,12 @@ public:
 
     bool Valid() const { return hwnd_ != nullptr; }
 
+    /// 当前定位请求的代次。每次发起查询前递增；DoEditSession 执行时比对，
+    /// 不一致说明这帧已被更新的请求取代，直接丢弃结果。
+    /// 只在 STA 线程写、STA 线程读；用 atomic 是因为 Deactivate/析构可能从
+    /// 其他线程观测状态。
+    std::atomic<LONG> generation{0};
+
 private:
     static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp);
     static StatusWindow* From(HWND hwnd);
@@ -43,6 +51,11 @@ private:
     wchar_t class_name_[64]{};
     int width_ = 0;
     int height_ = 0;
+
+    /// 上次实际提交给 SetWindowPos 的坐标。位置没变就不重复调用——
+    /// 高频轮询下避免无谓的窗口位置变更与桌面合成。
+    int last_x_ = INT_MIN;
+    int last_y_ = INT_MIN;
 };
 
 }  // namespace airtype
