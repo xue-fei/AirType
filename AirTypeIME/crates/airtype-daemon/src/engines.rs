@@ -17,8 +17,12 @@ pub struct Engines {
 
 pub fn build(cfg: &Config) -> Result<Engines> {
     if cfg.asr.engine == "sherpa" {
-        let set = airtype_asr_sherpa::build_engines(&cfg.sherpa, cfg.streaming.enabled)
-            .map_err(|e| anyhow!("sherpa 引擎装配失败: {e}"))?;
+        let set = airtype_asr_sherpa::build_engines(
+            &cfg.sherpa,
+            cfg.base_dir.as_deref(),
+            cfg.streaming.enabled,
+        )
+        .map_err(|e| anyhow!("sherpa 引擎装配失败: {e}"))?;
         return Ok(Engines {
             asr: set.offline,
             streaming: set.streaming,

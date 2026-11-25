@@ -48,8 +48,21 @@ pub struct ModelFiles {
 }
 
 /// 解析模型文件。显式路径优先；留空则按 `stem` 扫目录并跳过量化文件。
-pub fn resolve_model_files(cfg: &SherpaConfig) -> Result<ModelFiles, AsrError> {
-    let dir = Path::new(&cfg.model_dir);
+///
+/// `model_dir` 为相对路径时的基准（两级）：
+///   1. 进程当前目录（保持既有约定，源码树内 `models/...` 仍可用）；
+///   2. 配置文件所在目录（TSF DLL 注入任意宿主进程后 CWD 不可控，必须兜底）。
+pub fn resolve_model_files(cfg: &SherpaConfig, base_dir: Option<&Path>) -> Result<ModelFiles, AsrError> {
+    let raw = Path::new(&cfg.model_dir);
+    let dir: PathBuf = if raw.is_absolute() {
+        raw.to_path_buf()
+    } else if raw.is_dir() {
+        raw.to_path_buf()
+    } else if let Some(base) = base_dir {
+        base.join(raw)
+    } else {
+        raw.to_path_buf()
+    };
     if !dir.is_dir() {
         return Err(AsrError::Config(format!(
             "sherpa.model_dir 不是目录: {}（模型下载见 README 第 6 节）",
@@ -57,10 +70,10 @@ pub fn resolve_model_files(cfg: &SherpaConfig) -> Result<ModelFiles, AsrError> {
         )));
     }
     Ok(ModelFiles {
-        encoder: resolve_onnx(dir, &cfg.encoder, "encoder")?,
-        decoder: resolve_onnx(dir, &cfg.decoder, "decoder")?,
-        joiner: resolve_onnx(dir, &cfg.joiner, "joiner")?,
-        tokens: resolve_tokens(dir, &cfg.tokens)?,
+        encoder: resolve_onnx(&dir, &cfg.encoder, "encoder")?,
+        decoder: resolve_onnx(&dir, &cfg.decoder, "decoder")?,
+        joiner: resolve_onnx(&dir, &cfg.joiner, "joiner")?,
+        tokens: resolve_tokens(&dir, &cfg.tokens)?,
     })
 }
 
@@ -147,8 +160,8 @@ fn resolve_tokens(dir: &Path, explicit: &str) -> Result<PathBuf, AsrError> {
     Ok(p)
 }
 
-fn build_recognizer(cfg: &SherpaConfig) -> Result<OnlineRecognizer, AsrError> {
-    let files = resolve_model_files(cfg)?;
+fn build_recognizer(cfg: &SherpaConfig, base_dir: Option<&Path>) -> Result<OnlineRecognizer, AsrError> {
+    let files = resolve_model_files(cfg, base_dir)?;
     tracing::info!(
         encoder = %files.encoder.display(),
         decoder = %files.decoder.display(),
@@ -185,8 +198,12 @@ pub struct SherpaEngines {
     pub streaming: Option<Arc<dyn StreamingAsr>>,
 }
 
-pub fn build_engines(cfg: &SherpaConfig, with_streaming: bool) -> Result<SherpaEngines, AsrError> {
-    let recognizer = Arc::new(build_recognizer(cfg)?);
+pub fn build_engines(
+    cfg: &SherpaConfig,
+    base_dir: Option<&Path>,
+    with_streaming: bool,
+) -> Result<SherpaEngines, AsrError> {
+    let recognizer = Arc::new(build_recognizer(cfg, base_dir)?);
     Ok(SherpaEngines {
         offline: Arc::new(SherpaEngine {
             recognizer: recognizer.clone(),
@@ -368,7 +385,7 @@ mod tests {
             model_dir: dir.to_string_lossy().into_owned(),
             ..SherpaConfig::default()
         };
-        let files = resolve_model_files(&cfg).unwrap();
+        let files = resolve_model_files(&cfg, None).unwrap();
         for (label, p) in [
             ("encoder", &files.encoder),
             ("decoder", &files.decoder),
@@ -392,8 +409,39 @@ mod tests {
             model_dir: "/nonexistent/airtype/models".into(),
             ..SherpaConfig::default()
         };
-        let err = resolve_model_files(&cfg).unwrap_err();
+        let err = resolve_model_files(&cfg, None).unwrap_err();
         assert!(err.to_string().contains("不是目录"));
+    }
+
+    #[test]
+    fn relative_model_dir_falls_back_to_config_dir() {
+        // 安装布局：配置在 <root>/config/airtype.toml，模型在 <root>/models/...。
+        // 进程 CWD 不可控时，相对 model_dir 应能以配置文件目录为基准解析。
+        let root = temp_dir("basedir");
+        let cfg_dir = root.join("config");
+        let dir = root.join("models").join("sherpa-onnx-streaming-zipformer-bilingual-zh-en-2023-02-20");
+        std::fs::create_dir_all(&cfg_dir).unwrap();
+        std::fs::create_dir_all(&dir).unwrap();
+        write(&dir, "encoder.onnx");
+        write(&dir, "decoder.onnx");
+        write(&dir, "joiner.onnx");
+        write(&dir, "tokens.txt");
+
+        let cfg = SherpaConfig {
+            model_dir: "../models/sherpa-onnx-streaming-zipformer-bilingual-zh-en-2023-02-20".into(),
+            ..SherpaConfig::default()
+        };
+        let files = resolve_model_files(&cfg, Some(&cfg_dir)).unwrap();
+        assert!(files.encoder.is_file());
+        assert!(files.decoder.is_file());
+        assert!(files.joiner.is_file());
+        assert!(files.tokens.is_file());
+
+        // 对照：不给 base_dir 且 CWD 下没有该目录 -> 明确报「不是目录」。
+        let err = resolve_model_files(&cfg, None).unwrap_err();
+        assert!(err.to_string().contains("不是目录"));
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -409,7 +457,7 @@ mod tests {
             encoder: "encoder.int8.onnx".into(),
             ..SherpaConfig::default()
         };
-        let err = resolve_model_files(&cfg).unwrap_err();
+        let err = resolve_model_files(&cfg, None).unwrap_err();
         assert!(err.to_string().contains("只接受 fp32"));
 
         let _ = std::fs::remove_dir_all(&dir);

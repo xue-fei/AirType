@@ -2,6 +2,8 @@
 //!
 //! 同时派生 `Serialize`，让设置页面能把当前配置写回 `airtype.toml`。
 
+use std::path::PathBuf;
+
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -35,6 +37,14 @@ pub struct Config {
     pub inject: InjectConfig,
     #[serde(default)]
     pub web: WebConfig,
+
+    /// 配置文件所在目录。不参与序列化（设置页回写不应把它写进 TOML）。
+    ///
+    /// 存在的原因：`sherpa.model_dir` 之类相对路径必须相对**配置文件**解析，
+    /// 而不是相对进程当前目录——TSF DLL 会被注入到任意宿主进程（记事本、
+    /// Word、浏览器…），CWD 完全不可控，按 CWD 找模型必然失败。
+    #[serde(skip)]
+    pub base_dir: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -174,14 +184,17 @@ impl Default for Config {
             postprocess: PostProcessConfig::default(),
             inject: InjectConfig::default(),
             web: WebConfig::default(),
+            base_dir: None,
         }
     }
 }
 
 impl Config {
     pub fn load(path: impl AsRef<std::path::Path>) -> Result<Self, ConfigError> {
-        let text = std::fs::read_to_string(path)?;
-        let cfg: Self = toml::from_str(&text)?;
+        let text = std::fs::read_to_string(path.as_ref())?;
+        let mut cfg: Self = toml::from_str(&text)?;
+        // 相对路径（model_dir 等）以配置文件所在目录为基准。
+        cfg.base_dir = path.as_ref().parent().map(|p| p.to_path_buf());
         cfg.validate()?;
         Ok(cfg)
     }

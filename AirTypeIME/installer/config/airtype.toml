@@ -15,11 +15,32 @@ max_utterance_ms = 60000
 
 [asr]
 # mock | command | sherpa（推荐，内嵌 sherpa-onnx，见 airtype-sherpa.toml）
-engine = "mock"
+engine = "sherpa"
 # command 模式：把 {wav} 替换成临时 WAV 路径，进程 stdout 首行作为识别文本
 command = "python tools/asr_bridge.py {wav}"
 timeout_ms = 20000
 mock_text = "你好，这是一次 AirType 语音输入测试。"
+
+# 内嵌 sherpa-onnx 引擎参数（engine = "sherpa" 时生效）。
+# model_dir 相对「本配置文件所在目录」解析：安装后配置在
+# %ProgramFiles%\AirType\config\airtype.toml，模型在 %ProgramFiles%\AirType\models\...，
+# 故写 ../models/...。自动扫描 fp32 的 encoder/decoder/joiner 与 tokens.txt。
+[sherpa]
+model_dir = "../models/sherpa-onnx-streaming-zipformer-bilingual-zh-en-2023-02-20"
+encoder = ""
+decoder = ""
+joiner = ""
+tokens = ""
+num_threads = 4
+provider = "cpu"
+modeling_unit = "cjkchar"
+decoding_method = "greedy_search"
+enable_endpoint = false
+
+# 边说边出字（partial 实时上屏）。默认关闭 = 松键后整段解码一次出文本；
+# 需要流式效果就把 enabled 改成 true（chunk_ms/replace 见 airtype-sherpa.toml）。
+[streaming]
+enabled = false
 
 [postprocess]
 trim_filler_words = true

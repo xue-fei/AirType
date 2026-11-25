@@ -45,6 +45,27 @@ $required = @(
 foreach ($f in $required) {
     if (-not (Test-Path -LiteralPath $f)) { Fail "缺少源文件：$f（先跑 build_installer.ps1）" }
 }
+
+# ---------- 2.1 检查 sherpa fp32 模型 ----------
+# airtype.iss 已把模型打进 [Files]；缺模型也能编译，但装完 engine=sherpa 会报
+# 「model_dir 不是目录」，等于白装。这里提前拦住。
+$modelDir = Join-Path (Split-Path -Parent $Root) 'models\sherpa-onnx-streaming-zipformer-bilingual-zh-en-2023-02-20'
+$modelRequired = @(
+    'encoder-epoch-99-avg-1.onnx',
+    'decoder-epoch-99-avg-1.onnx',
+    'joiner-epoch-99-avg-1.onnx',
+    'tokens.txt'
+)
+foreach ($m in $modelRequired) {
+    $p = Join-Path $modelDir $m
+    if (-not (Test-Path -LiteralPath $p)) {
+        Fail "缺少模型文件：$p`n模型未随安装包分发，请先下载/放置到 $modelDir"
+    }
+}
+$modelSize = [math]::Round((Get-ChildItem -LiteralPath $modelDir -File |
+            Where-Object { $_.Name -notlike '*.int8.onnx' } |
+            Measure-Object Length -Sum).Sum / 1MB, 0)
+Log "模型就位：$modelDir（fp32 约 $modelSize MB，安装包将明显变大）" 'Cyan'
 Log '源文件齐全。' 'Green'
 
 # ---------- 3. 编译 ----------

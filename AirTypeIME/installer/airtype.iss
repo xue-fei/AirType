@@ -58,6 +58,10 @@ Source: "config\airtype.toml";        DestDir: "{app}\config"; Flags: onlyifdoes
 Source: "tools\simulate_voice.ps1";   DestDir: "{app}\tools"; Flags: ignoreversion
 Source: "tools\close_status.ps1";     DestDir: "{app}\tools"; Flags: ignoreversion
 Source: "VERIFY.md";                  DestDir: "{app}"; Flags: ignoreversion
+; 内嵌 sherpa-onnx fp32 模型（encoder/decoder/joiner/tokens.txt/bpe.model，约 458MB）。
+; 只打 fp32：resolve_model_files 明确跳过量化文件，int8 版约 209MB 不装。
+; 缺模型时 engine = "sherpa" 会在输入法激活时报 model_dir 不是目录，无法识别。
+Source: "..\models\sherpa-onnx-streaming-zipformer-bilingual-zh-en-2023-02-20\*"; DestDir: "{app}\models\sherpa-onnx-streaming-zipformer-bilingual-zh-en-2023-02-20"; Flags: ignoreversion recursesubdirs createallsubdirs; Excludes: "*.int8.onnx"
 
 [Code]
 const
