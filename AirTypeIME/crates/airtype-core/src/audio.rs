@@ -34,6 +34,15 @@ impl PcmBuffer {
         self.samples.clear();
     }
 
+    /// 直接追加已解码的样本（降噪后的数据走这条路，避免再转回字节）。
+    pub fn append_samples(&mut self, samples: &[i16], max_ms: u32) -> Result<usize, AudioError> {
+        if self.samples.len() + samples.len() > self.max_samples {
+            return Err(AudioError::UtteranceTooLong(max_ms));
+        }
+        self.samples.extend_from_slice(samples);
+        Ok(samples.len())
+    }
+
     pub fn append_le_bytes(&mut self, bytes: &[u8], max_ms: u32) -> Result<usize, AudioError> {
         if bytes.len() % 2 != 0 {
             return Err(AudioError::OddPayload(bytes.len()));
@@ -98,6 +107,17 @@ pub fn frame_level(bytes: &[u8]) -> u16 {
     }
     let rms = (sum / count as f64).sqrt() as f32;
     let db = 20.0 * rms.max(1e-6).log10();
+
+    // 噪声门：麦克风底噪通常落在 -70~-50 dBFS，它本身不为 0，映射到
+    // 0~1000 后仍会占几个百分点——表现为「没说话时图标底部一直留一
+    // 条绿线」。低于 -48 dBFS 一律判静音。
+    // 阈值取 -48 而不是 -60：正常说话约 -30 dBFS、轻声约 -40，
+    // -48 能挡住底噪又不至于把轻声也切掉。
+    const NOISE_FLOOR_DB: f32 = -48.0;
+    if db < NOISE_FLOOR_DB {
+        return 0;
+    }
+
     let norm = ((db + 60.0) / 60.0).clamp(0.0, 1.0);
     (norm * 1000.0).round() as u16
 }
@@ -163,5 +183,19 @@ mod tests {
         assert_eq!(u32::from_le_bytes(wav[24..28].try_into().unwrap()), 16000);
         assert_eq!(u32::from_le_bytes(wav[40..44].try_into().unwrap()), 6);
         assert_eq!(wav.len(), 50);
+    }
+
+    #[test]
+    fn silent_and_noise_frames_hit_zero() {
+        // 数字静音
+        assert_eq!(frame_level(&[0u8; 640]), 0);
+        // 极小幅度底噪（RMS 约 3e-5，-90dBFS）也必须判 0，
+        // 否则图标底部会留一条绿线
+        let noise: Vec<u8> = (0..320).flat_map(|_| 1i16.to_le_bytes()).collect();
+        assert_eq!(frame_level(&noise), 0);
+        // 正常说话（幅度 0.1，约 -20dBFS）要能过门，且不该满格
+        let speech: Vec<u8> = (0..320).flat_map(|_| (-3277i16).to_le_bytes()).collect();
+        let lv = frame_level(&speech);
+        assert!(lv > 300 && lv < 1000, "speech level = {lv}");
     }
 }

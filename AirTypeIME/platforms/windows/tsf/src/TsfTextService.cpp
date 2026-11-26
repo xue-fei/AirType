@@ -1109,6 +1109,15 @@ void TsfTextService::OnLevel(int level) {
     // 上升快、下降慢：音量逐帧抖动时填充不闪，视觉上更像电平表。
     const float alpha = target > level_smoothed_ ? 0.55f : 0.22f;
     level_smoothed_ += (target - level_smoothed_) * alpha;
+
+    // 平滑值收敛到亚像素量级时直接归零。
+    // EMA 是指数衰减、永远到不了 0，而 38px 的圆里只要 milli≥27 就会画出
+    // 1px 的绿边——不斩断的话，说完话图标底部会永久留一条绿线。
+    if (level_smoothed_ < 0.03f) {
+        level_smoothed_ = 0.0f;
+        status_.SetLevel(0);
+        return;
+    }
     status_.SetLevel(static_cast<int>(level_smoothed_ * 1000.0f + 0.5f));
 }
 

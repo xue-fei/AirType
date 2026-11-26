@@ -1,0 +1,19 @@
+[package]
+name = "airtype-denoise"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "DPDFNet 流式语音增强（onnxruntime / ort）"
+
+[dependencies]
+airtype-core = { workspace = true }
+# 必须动态加载：sherpa-onnx-sys 用静态 CRT(MT) 且已静态打包了一份 onnxruntime，
+# ort 若也静态链接会与它符号重定义 + CRT 不匹配（LNK2005 / LNK2038）。
+# load-dynamic 让 ort 在运行时加载 {app}\lib\onnxruntime.dll，两边互不干扰。
+ort = { version = "2.0.0-rc.15", default-features = false, features = ["load-dynamic", "std"] }
+rustfft = "6"
+thiserror = { workspace = true }
+tracing = { workspace = true }
+# 只用来读 ONNX metadata（STFT 参数 + state 归一化初值）。
+# 版本要和 ort 内部用的 prost 不冲突——这里独立读文件，不共享类型。
+prost = "0.11"

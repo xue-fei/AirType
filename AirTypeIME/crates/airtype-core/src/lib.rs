@@ -16,6 +16,7 @@
 pub mod asr;
 pub mod audio;
 pub mod config;
+pub mod denoise;
 pub mod pipeline;
 pub mod postprocess;
 pub mod protocol;

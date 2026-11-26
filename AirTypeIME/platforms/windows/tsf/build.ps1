@@ -142,6 +142,39 @@ New-Item -ItemType Directory -Force -Path $BinDir | Out-Null
 # 少了这一步会表现为激活成功但日志报「airtype_ffi.dll 加载失败: 126」。
 $ImeRoot = (Resolve-Path (Join-Path $Root "..\..\..")).Path
 $CargoProfile = if ($Config -eq "Debug") { "debug" } else { "release" }
+
+# Rust 核心必须在这里重建。本脚本只编 C++ 外壳，airtype_ffi.dll 是 Rust
+# 产物；如果只复制 target\$CargoProfile 里现成的文件，改了 Rust 之后复制
+# 的还是上一次的旧 DLL —— 表现是「代码明明改了，行为一点没变」，而且日
+# 志、时序、文件大小都正常，极难察觉（本项目真实踩过：大小写归一失效）。
+$Cargo = (Get-Command cargo -ErrorAction SilentlyContinue).Source
+if (-not $Cargo) {
+    $CargoCandidate = Join-Path $env:USERPROFILE ".cargo\bin\cargo.exe"
+    if (Test-Path $CargoCandidate) { $Cargo = $CargoCandidate }
+}
+if ($Cargo) {
+    Write-Host "构建 Rust 核心（$CargoProfile）..."
+    $CargoArgs = @("build", "-p", "airtype-ffi")
+    if ($Config -eq "Release") { $CargoArgs += "--release" }
+    Push-Location $ImeRoot
+    # cargo 把进度写 stderr，而本脚本开了 ErrorActionPreference=Stop，
+    # 直接调用会被 PowerShell 当成 NativeCommandError 中断构建。
+    $prevEap = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    try {
+        & $Cargo @CargoArgs
+        $cargoExit = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $prevEap
+        Pop-Location
+    }
+    if ($cargoExit -ne 0) {
+        throw "cargo build -p airtype-ffi 失败（exit=$cargoExit）"
+    }
+} else {
+    Write-Host "警告：找不到 cargo，跳过 Rust 构建，将沿用 target\$CargoProfile 里现有的 DLL。"
+}
+
 $Ffi = Join-Path $ImeRoot "target\$CargoProfile\airtype_ffi.dll"
 if (Test-Path $Ffi) {
     try {

@@ -88,6 +88,14 @@ pub struct Pipeline {
 }
 
 impl Pipeline {
+    /// 注入降噪器（builder 风格，不改 `new` 的签名以免波及所有调用点）。
+    ///
+    /// 降噪挂在 Session 的音频入口，所以必须在收到第一帧之前调用。
+    pub fn with_denoiser(mut self, d: Box<dyn crate::denoise::FrameDenoiser>) -> Self {
+        self.session.set_denoiser(d);
+        self
+    }
+
     /// `streaming` 由上层（daemon / FFI 外壳）按 `asr.engine` 装配后传入：
     /// core 定义 trait，但不能依赖 sherpa-onnx 之类的 native 引擎实现。
     pub fn new(
@@ -337,7 +345,12 @@ mod tests {
     use crate::streaming::{build_streaming_engine, StreamingAsr};
 
     fn cfg() -> Config {
-        Config::default()
+        let mut c = Config::default();
+        // 本模块的用例都在验证「整段解码」路径（END 后一次识别出 Recognized）。
+        // streaming 默认已改为开启，这里显式关掉；流式路径由 streaming.rs
+        // 和下面的 streaming_* 用例覆盖。
+        c.streaming.enabled = false;
+        c
     }
 
     /// 模拟 daemon 的装配：按 `streaming.enabled` 决定是否给流式引擎。

@@ -55,8 +55,42 @@ struct ServerState {
     on_partial: PartialCallback,
     /// 音频电平通知（毫电平 0~1000），外壳用来画音量填充。
     on_level: LevelCallback,
+    /// 降噪模型（None = 未启用）。模型本身可被多连接共享，
+    /// 每条连接各自 new 一个 `StreamDenoiser`，RNN 状态互不干扰。
+    denoise: Option<Arc<airtype_denoise::DenoiseModel>>,
     /// 设备状态快照，给设置页面用。
     registry: Arc<Registry>,
+}
+
+/// 按 `[denoise]` 配置加载 DPDFNet 模型。任何失败都只降级为「不降噪」。
+fn build_denoiser(config: &Config) -> Option<Arc<airtype_denoise::DenoiseModel>> {
+    if !config.denoise.enabled {
+        return None;
+    }
+    // model_dir 相对配置文件解析（同 sherpa.model_dir 的规则），
+    // 因为 TSF DLL 注入宿主后 CWD 不可控。
+    let dir = match &config.base_dir {
+        Some(base) => base.join(&config.denoise.model_dir),
+        None => std::path::PathBuf::from(&config.denoise.model_dir),
+    };
+    let path = dir.join(&config.denoise.model);
+    let runtime = match &config.base_dir {
+        Some(base) => base.join(&config.denoise.runtime),
+        None => std::path::PathBuf::from(&config.denoise.runtime),
+    };
+    match airtype_denoise::DenoiseModel::load(&path, Some(&runtime)) {
+        Ok(m) => {
+            tracing::info!(model = %path.display(), "降噪已启用（DPDFNet）");
+            Some(Arc::new(m))
+        }
+        Err(e) => {
+            tracing::warn!(
+                model = %path.display(),
+                "降噪模型加载失败，本次不降噪: {e}"
+            );
+            None
+        }
+    }
 }
 
 /// 启动服务，直到 `shutdown` 被触发。非阻塞于调用者之外（本身是 async）。
@@ -78,6 +112,8 @@ pub async fn run_server(
 
     let engines = engines::build(&config)?;
     let asr = engines.asr;
+    // 降噪模型加载失败不致命：记一条日志，退回不降噪继续跑。
+    let denoise = build_denoiser(&config);
     let injector = build_injector(&config.inject).context("build text injector")?;
 
     tracing::info!(
@@ -101,6 +137,7 @@ pub async fn run_server(
         on_text,
         on_partial,
         on_level,
+        denoise,
         registry,
     });
 
@@ -134,10 +171,15 @@ async fn handle_connection(
         .with_context(|| format!("websocket handshake with {peer} failed"))?;
     let (mut sink, mut source) = ws.split();
 
-    let pipeline = Arc::new(Mutex::new(
-        Pipeline::new(&state.config, state.asr.clone(), state.streaming.clone())
-            .context("build pipeline")?,
-    ));
+    let mut pipeline = Pipeline::new(&state.config, state.asr.clone(), state.streaming.clone())
+        .context("build pipeline")?;
+    // 每条连接一个降噪器：RNN/OLA 状态必须独立，否则两路语音互相污染。
+    if let Some(model) = &state.denoise {
+        pipeline = pipeline.with_denoiser(Box::new(airtype_denoise::StreamDenoiser::new(
+            model.clone(),
+        )));
+    }
+    let pipeline = Arc::new(Mutex::new(pipeline));
     let mut trace = StreamTrace::default();
     tracing::info!(%peer, "AirMic 已连接");
     // 先登记连接（此时还不知道 device 名），START 帧到达时再补名字。

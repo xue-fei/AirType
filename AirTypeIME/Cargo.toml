@@ -5,6 +5,7 @@ members = [
     "crates/airtype-daemon",
     "crates/airtype-ffi",
     "crates/airtype-asr-sherpa",
+    "crates/airtype-denoise",
 ]
 
 [workspace.package]
@@ -17,6 +18,7 @@ authors = ["xuefei"]
 airtype-core = { path = "crates/airtype-core" }
 airtype-daemon = { path = "crates/airtype-daemon" }
 airtype-asr-sherpa = { path = "crates/airtype-asr-sherpa" }
+airtype-denoise = { path = "crates/airtype-denoise" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"

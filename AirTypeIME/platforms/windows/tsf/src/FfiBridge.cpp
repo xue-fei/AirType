@@ -10,23 +10,60 @@ namespace airtype {
 
 namespace {
 
+// {app}\lib\airtype_ffi.dll —— 所有版本目录共用的那一份核心。
+//
+// 为什么这么放：ffi 有 20MB，塞进 versions\<ver>\ 会让每个历史版本目录都占
+// 20MB；而 TSF 外壳被宿主进程常驻锁定、旧版本删不掉，于是残留目录越堆越大
+// （实测 3 个版本 = 60MB）。把 ffi 挪到共享 lib 后，版本目录只剩 80KB 的
+// tsf + 90KB 探针，残留几乎不可见。
+//
+// 外壳在 {app}\versions\<版本>\，所以是「上两级再进 lib」。
+std::wstring SharedLibPath() {
+    const std::wstring dir = SelfModuleDir();
+    if (dir.empty()) {
+        return {};
+    }
+    const std::wstring raw = dir + L"..\\..\\lib\\airtype_ffi.dll";
+    wchar_t full[MAX_PATH]{};
+    const DWORD n = GetFullPathNameW(raw.c_str(), MAX_PATH, full, nullptr);
+    if (n == 0 || n >= MAX_PATH) {
+        return {};
+    }
+    return full;
+}
+
 std::wstring DefaultSearchPath() {
+    // 查找顺序（前一个不存在才看后一个）：
+    //   1. {app}\lib\              共享核心（新布局，优先——避免旧布局残留的同目录
+    //                              ffi 抢先被加载，导致"装了新版还在跑旧核心"）
+    //   2. 本模块目录              旧布局 / 探针独立运行时 ffi 就在旁边
+    //   3. 宿主 exe 目录           最后兜底
+    //
     // 外壳是 in-proc 服务器，会被注入到任意宿主进程（记事本、Word…），
-    // 宿主 exe 目录下通常没有 airtype_ffi.dll，因此优先按本模块目录找；
-    // 探针等独立 exe 把 ffi 放在自己旁边的用法继续兼容。
-    const std::wstring dirs[] = {SelfModuleDir(), HostExeDir()};
-    for (const std::wstring& dir : dirs) {
-        if (dir.empty()) {
+    // 宿主 exe 目录下通常没有 airtype_ffi.dll，所以它排最后。
+    const std::wstring shared = SharedLibPath();
+    const std::wstring local = SelfModuleDir();
+    const std::wstring candidates[] = {
+        shared,
+        local.empty() ? std::wstring() : local + L"airtype_ffi.dll",
+    };
+    for (const std::wstring& candidate : candidates) {
+        if (candidate.empty()) {
             continue;
         }
-        const std::wstring candidate = dir + L"airtype_ffi.dll";
         if (GetFileAttributesW(candidate.c_str()) != INVALID_FILE_ATTRIBUTES) {
             return candidate;
         }
     }
-    // 两个目录都没有时，让 LoadLibrary 的错误信息指向最可能的位置。
-    const std::wstring dir = SelfModuleDir();
-    return dir.empty() ? std::wstring(L"airtype_ffi.dll") : dir + L"airtype_ffi.dll";
+    const std::wstring host = HostExeDir();
+    if (!host.empty()) {
+        const std::wstring candidate = host + L"airtype_ffi.dll";
+        if (GetFileAttributesW(candidate.c_str()) != INVALID_FILE_ATTRIBUTES) {
+            return candidate;
+        }
+    }
+    // 全都找不到时，让 LoadLibrary 的错误信息指向最可能的位置。
+    return shared.empty() ? std::wstring(L"airtype_ffi.dll") : shared;
 }
 
 }  // namespace

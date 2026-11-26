@@ -30,6 +30,8 @@ pub struct Config {
     #[serde(default)]
     pub sherpa: SherpaConfig,
     #[serde(default)]
+    pub denoise: DenoiseConfig,
+    #[serde(default)]
     pub streaming: StreamingConfig,
     #[serde(default)]
     pub postprocess: PostProcessConfig,
@@ -118,6 +120,38 @@ pub struct SherpaConfig {
     /// 是否启用端点检测。AirType 用 PTT 松键收尾，保持 false。
     #[serde(default)]
     pub enable_endpoint: bool,
+    /// 热词文件，每行一个词/短语（UTF-8）。空 = 不启用。
+    ///
+    /// 用途：修正模型系统性听错的专有名词与高频词。相对路径按
+    /// 「配置文件所在目录 → CWD」解析，与 `model_dir` 同一套规则。
+    #[serde(default)]
+    pub hotwords_file: String,
+    /// 热词偏置强度。常用 1.0~3.0，过大（>4）容易把无关音频吸成热词。
+    #[serde(default = "default_hotwords_score")]
+    pub hotwords_score: f32,
+}
+
+/// 流式语音降噪（DPDFNet）。
+///
+/// 默认关闭：要额外加载 9.8MB 模型、多占约 20MB 内存，而且安静环境下
+/// 降噪收益有限。嘈杂环境（办公室、车里）建议打开。
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct DenoiseConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// 模型目录，相对「配置文件所在目录」解析（与 `sherpa.model_dir` 规则一致）。
+    #[serde(default = "default_denoise_dir")]
+    pub model_dir: String,
+    /// 模型文件名。16 kHz 模型族，`dpdfnet2` 是速度/效果的平衡点
+    /// （2.49M 参数，单线程 RTF 约 0.2）。
+    #[serde(default = "default_denoise_model")]
+    pub model: String,
+    /// onnxruntime.dll 路径，同样相对配置文件目录解析。
+    ///
+    /// 为什么必须显式给：ort 走 load-dynamic，而 sherpa-onnx 已经静态打包了
+    /// 另一份 onnxruntime，两边的 CRT 和符号会冲突，不能共用。
+    #[serde(default = "default_denoise_runtime")]
+    pub runtime: String,
 }
 
 /// 流式识别（边说边出字）参数。`streaming.enabled` 为 true 时生效；
@@ -153,6 +187,12 @@ pub struct PostProcessConfig {
     /// 其余小写"归一（`TODAY` → `Today`），单字母 `I` / `A` 保持原样。
     #[serde(default = "yes")]
     pub normalize_english_case: bool,
+    /// 中英之间补空格（`Today is礼拜二` → `Today is 礼拜二`）。
+    ///
+    /// 只处理含字母的英文词，`3月` / `第2种` 这类数字+中文不动。
+    /// 不想要可以关掉。
+    #[serde(default = "yes")]
+    pub space_cjk_latin: bool,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -187,6 +227,7 @@ impl Default for Config {
             audio: AudioConfig::default(),
             asr: AsrConfig::default(),
             sherpa: SherpaConfig::default(),
+            denoise: DenoiseConfig::default(),
             streaming: StreamingConfig::default(),
             postprocess: PostProcessConfig::default(),
             inject: InjectConfig::default(),
@@ -292,6 +333,14 @@ defaults!(SherpaConfig,
     modeling_unit: default_sherpa_modeling_unit(),
     decoding_method: default_sherpa_decoding_method(),
     enable_endpoint: false,
+    hotwords_file: String::new(),
+    hotwords_score: default_hotwords_score(),
+);
+defaults!(DenoiseConfig,
+    enabled: false,
+    model_dir: default_denoise_dir(),
+    model: default_denoise_model(),
+    runtime: default_denoise_runtime(),
 );
 defaults!(StreamingConfig,
     enabled: default_streaming_enabled(),
@@ -304,6 +353,7 @@ defaults!(PostProcessConfig,
     ensure_punctuation: true,
     collapse_whitespace: true,
     normalize_english_case: true,
+    space_cjk_latin: true,
 );
 defaults!(InjectConfig,
     mode: default_inject_mode(),
@@ -361,8 +411,27 @@ fn default_sherpa_modeling_unit() -> String {
 fn default_sherpa_decoding_method() -> String {
     "greedy_search".into()
 }
+fn default_hotwords_score() -> f32 {
+    1.5
+}
+
+fn default_denoise_dir() -> String {
+    "../models/dpdfnet".to_string()
+}
+
+fn default_denoise_model() -> String {
+    "dpdfnet2.onnx".to_string()
+}
+
+fn default_denoise_runtime() -> String {
+    "../lib/onnxruntime.dll".to_string()
+}
+
 fn default_streaming_enabled() -> bool {
-    false
+    // 默认开：边说边出字是输入法的常规体验（搜狗/微软拼音都是这样），
+    // 整段解码要等松键后静默一两秒才冒字，用户会以为没反应。
+    // 想要"松键后一次性给完整文本"的，在 [streaming] 里写 enabled = false。
+    true
 }
 fn default_chunk_ms() -> u32 {
     200
@@ -419,7 +488,7 @@ mod tests {
         assert_eq!(c.audio.sample_rate, 16000);
         assert_eq!(c.asr.engine, "mock");
         assert_eq!(c.inject.mode, "none");
-        assert!(!c.streaming.enabled, "默认整段解码，不启用流式");
+        assert!(c.streaming.enabled, "默认开启流式（边说边出字）");
     }
 
     #[test]
@@ -455,7 +524,9 @@ mod tests {
     #[test]
     fn streaming_defaults_are_safe() {
         let s = StreamingConfig::default();
-        assert!(!s.enabled);
+        // 默认开启：边说边出字是输入法常规体验；chunk_ms 200 是解码频率与
+        // 首字延迟的折中，replace 让 partial 按最长公共前缀覆盖重写。
+        assert!(s.enabled);
         assert_eq!(s.chunk_ms, 200);
         assert!(s.replace);
     }
