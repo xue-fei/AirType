@@ -55,6 +55,8 @@ bool FfiBridge::Load(const std::wstring& path) {
     init_ = reinterpret_cast<FnInit>(Proc("airtype_init"));
     set_text_ = reinterpret_cast<FnSetText>(Proc("airtype_set_text_callback"));
     set_partial_ = reinterpret_cast<FnSetPartial>(Proc("airtype_set_partial_callback"));
+    // 可选导出：旧版 ffi 没有它，缺失时只为空指针，不影响其它功能。
+    set_level_ = reinterpret_cast<FnSetLevel>(Proc("airtype_set_level_callback"));
     start_ = reinterpret_cast<FnStart>(Proc("airtype_start"));
     stop_ = reinterpret_cast<FnStop>(Proc("airtype_stop"));
     last_error_proc_ = reinterpret_cast<FnLastError>(Proc("airtype_last_error"));
@@ -91,6 +93,13 @@ int32_t FfiBridge::SetPartialCallback(airtype_partial_cb cb, void* userdata) {
         return AIRTYPE_ERR_INTERNAL;
     }
     return set_partial_(cb, userdata);
+}
+
+int32_t FfiBridge::SetLevelCallback(airtype_level_cb cb, void* userdata) {
+    if (!set_level_) {
+        return AIRTYPE_ERR_STATE;  // 旧版 ffi 没有该导出
+    }
+    return set_level_(cb, userdata);
 }
 
 int32_t FfiBridge::Start() {

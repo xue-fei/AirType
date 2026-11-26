@@ -19,6 +19,7 @@ using FnVersion = const char* (*)();
 using FnInit = int32_t (*)(const char*);
 using FnSetText = int32_t (*)(airtype_text_cb, void*);
 using FnSetPartial = int32_t (*)(airtype_partial_cb, void*);
+using FnSetLevel = int32_t (*)(airtype_level_cb, void*);
 using FnStart = int32_t (*)();
 using FnStop = void (*)();
 using FnLastError = const char* (*)();
@@ -49,6 +50,9 @@ public:
     int32_t Init(const std::string& config_path_utf8);
     int32_t SetTextCallback(airtype_text_cb cb, void* userdata);
     int32_t SetPartialCallback(airtype_partial_cb cb, void* userdata);
+    /// 注册音频电平回调。旧版 ffi 没有这个导出时返回 AIRTYPE_ERR_STATE，
+    /// 调用方忽略即可（音量可视化不可用，其余功能不受影响）。
+    int32_t SetLevelCallback(airtype_level_cb cb, void* userdata);
     int32_t Start();
     void Stop();
 
@@ -62,6 +66,7 @@ private:
     FnInit init_ = nullptr;
     FnSetText set_text_ = nullptr;
     FnSetPartial set_partial_ = nullptr;
+    FnSetLevel set_level_ = nullptr;
     FnStart start_ = nullptr;
     FnStop stop_ = nullptr;
     FnLastError last_error_proc_ = nullptr;

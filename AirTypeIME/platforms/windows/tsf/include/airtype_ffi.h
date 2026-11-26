@@ -52,6 +52,19 @@ typedef void (*airtype_text_cb)(const char *utf8_text, void *userdata);
 typedef void (*airtype_partial_cb)(const char *utf8_text, int32_t delete_chars,
                                    const char *utf8_append, void *userdata);
 
+/* 音频电平回调：每收到一个 AUDIO 帧触发一次（约 20ms 一帧）。
+ *
+ *   level : 毫电平 0~1000，0 = 静音、1000 = 满幅；
+ *           **-1 = PTT 结束/取消**，外壳应让可视化立即回落到 0。
+ *           （句中的静音帧同样是 0，故结束必须用 -1 区分，
+ *             否则外壳无法判断"停顿"与"录完"。）
+ *
+ * 供外壳做音量可视化（如状态图标按音量从底部向上填充）。
+ * 与文本回调同在库内部线程触发，外壳需自行 marshal 到 UI 线程，
+ * 且不要在回调里做耗时操作（音频帧 20ms 一帧，阻塞会拖慢收流）。
+ * 不注册时核心只跳过回调，不影响识别。 */
+typedef void (*airtype_level_cb)(int32_t level, void *userdata);
+
 /* 库版本号，静态字符串。 */
 AIRTYPE_API const char *airtype_version(void);
 
@@ -66,6 +79,10 @@ AIRTYPE_API int32_t airtype_set_text_callback(airtype_text_cb cb, void *userdata
 /* 注册流式中间结果回调。语义同 airtype_set_text_callback。
  * 不注册时 partial 只在库内记日志，不影响最终文本。 */
 AIRTYPE_API int32_t airtype_set_partial_callback(airtype_partial_cb cb, void *userdata);
+
+/* 注册音量电平回调。语义同 airtype_set_text_callback。
+ * 不注册时只跳过电平通知，不影响识别与上屏。 */
+AIRTYPE_API int32_t airtype_set_level_callback(airtype_level_cb cb, void *userdata);
 
 /* 启动 WebSocket 服务（非阻塞，内部起 tokio runtime）。 */
 AIRTYPE_API int32_t airtype_start(void);

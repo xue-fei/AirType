@@ -12,7 +12,7 @@ use std::ffi::{c_char, c_void, CStr, CString};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 
 use airtype_core::Config;
-use airtype_daemon::{run_server, PartialCallback, Registry, TextCallback};
+use airtype_daemon::{run_server, LevelCallback, PartialCallback, Registry, TextCallback};
 
 const AIRTYPE_OK: i32 = 0;
 const AIRTYPE_ERR_CONFIG: i32 = -2;
@@ -24,6 +24,8 @@ type TextCb = extern "C" fn(*const c_char, *mut c_void);
 /// `(累积文本, 需退格字符数, 增量文本, userdata)`。
 /// `delete_chars` 用 i32 是为了跨语言对齐；负数按 0 处理。
 type PartialCb = extern "C" fn(*const c_char, i32, *const c_char, *mut c_void);
+/// `(毫电平 0~1000, userdata)`。0 = 静音、1000 = 满幅。
+type LevelCb = extern "C" fn(i32, *mut c_void);
 
 struct Global {
     runtime: Option<tokio::runtime::Runtime>,
@@ -31,6 +33,7 @@ struct Global {
     /// 函数指针 + userdata 的指针值（存 usize 以保持 Global: Send）
     callback: Option<(TextCb, usize)>,
     partial_callback: Option<(PartialCb, usize)>,
+    level_callback: Option<(LevelCb, usize)>,
     shutdown: Option<tokio::sync::oneshot::Sender<()>>,
     last_error: CString,
     /// 正在调用宿主回调的数量。`airtype_stop` 必须等它归零才返回，
@@ -45,6 +48,7 @@ impl Default for Global {
             config: None,
             callback: None,
             partial_callback: None,
+            level_callback: None,
             shutdown: None,
             last_error: CString::new("").unwrap(),
             in_flight_callbacks: 0,
@@ -108,6 +112,16 @@ fn begin_text_callback() -> (Option<(TextCb, usize)>, CallbackGuard) {
 fn begin_partial_callback() -> (Option<(PartialCb, usize)>, CallbackGuard) {
     let mut g = global().lock().unwrap();
     let cb = g.partial_callback;
+    let entered = cb.is_some();
+    if entered {
+        g.in_flight_callbacks += 1;
+    }
+    (cb, CallbackGuard(entered))
+}
+
+fn begin_level_callback() -> (Option<(LevelCb, usize)>, CallbackGuard) {
+    let mut g = global().lock().unwrap();
+    let cb = g.level_callback;
     let entered = cb.is_some();
     if entered {
         g.in_flight_callbacks += 1;
@@ -179,6 +193,17 @@ pub extern "C" fn airtype_set_partial_callback(
 }
 
 #[no_mangle]
+pub extern "C" fn airtype_set_level_callback(
+    cb: Option<LevelCb>,
+    userdata: *mut c_void,
+) -> i32 {
+    let mut g = global().lock().unwrap();
+    g.level_callback = cb.map(|f| (f, userdata as usize));
+    store_error(&mut g, "");
+    AIRTYPE_OK
+}
+
+#[no_mangle]
 pub extern "C" fn airtype_start() -> i32 {
     let mut g = global().lock().unwrap();
     if g.runtime.is_none() || g.config.is_none() {
@@ -225,6 +250,13 @@ pub extern "C" fn airtype_start() -> i32 {
             }
         });
 
+    let on_level: LevelCallback = Arc::new(|level: i32| {
+        let (cb, _guard) = begin_level_callback();
+        if let Some((f, userdata)) = cb {
+            f(level, userdata as *mut c_void);
+        }
+    });
+
     let (tx, rx) = tokio::sync::oneshot::channel::<()>();
     g.runtime.as_ref().unwrap().spawn(async move {
         if let Err(e) = run_server(
@@ -232,6 +264,7 @@ pub extern "C" fn airtype_start() -> i32 {
             Arc::new(Registry::new()),
             on_text,
             on_partial,
+            on_level,
             rx,
         )
         .await
@@ -252,6 +285,7 @@ pub extern "C" fn airtype_stop() {
         // 注销回调：之后进入的 begin_*_callback 读到 None，不再登记新的在途调用。
         g.callback = None;
         g.partial_callback = None;
+        g.level_callback = None;
         if let Some(tx) = g.shutdown.take() {
             let _ = tx.send(());
         }

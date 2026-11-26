@@ -877,7 +877,7 @@ static LRESULT CALLBACK StatusPreviewWndProc(HWND hwnd, UINT msg, WPARAM wp, LPA
 
 // 状态图标外观 + 定位预览：自绘文字和光标，显示图标并抓屏。
 // 只验证 StatusWindow 本身，不涉及 TSF 文本服务或 FFI。
-int RunStatusPreview(const std::string& path_utf8) {
+int RunStatusPreview(const std::string& path_utf8, int level_milli) {
     airtype::log("=== 状态图标预览 ===");
     HRESULT hr = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
     if (FAILED(hr) && hr != RPC_E_CHANGED_MODE) {
@@ -925,6 +925,8 @@ int RunStatusPreview(const std::string& path_utf8) {
         caret.bottom = client.y + 22;
     }
     status.FollowCaret(caret);
+    // 音量填充预览：--level 指定毫电平（0~1000），验证绿色从底部升起的高度。
+    status.SetLevel(level_milli);
 
     Sleep(400);  // 让分层窗口完成合成
     const std::wstring path = utf8_to_utf16(path_utf8);
@@ -936,6 +938,78 @@ int RunStatusPreview(const std::string& path_utf8) {
     CoUninitialize();
     airtype::log("状态图标预览截图: %s", path_utf8.c_str());
     return ok ? 0 : 1;
+}
+
+// 诊断：直接打印「悬浮图标两道门禁」在当前真实状态下的判定结果。
+//
+// 为什么需要它：UpdateStatusPosition() 里那两个判据（本进程是否前台、
+// AirType 是否为活动键盘 TIP）一旦误判就会直接 Hide()，表现为「切到 AirType
+// 后图标完全不出现」。这两个函数是匿名命名空间里的静态函数，探针无法调用，
+// 所以在这里等价复现一遍用于对照。
+int RunGateDiagnostic() {
+    airtype::log("=== 悬浮图标门禁诊断 ===");
+    HRESULT hr = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+    if (FAILED(hr) && hr != RPC_E_CHANGED_MODE) {
+        airtype::log_hr("CoInitializeEx(STA)", hr);
+        return 1;
+    }
+
+    // 门禁①：本进程是否前台进程。
+    HWND fg = GetForegroundWindow();
+    DWORD fg_pid = 0;
+    if (fg != nullptr) {
+        GetWindowThreadProcessId(fg, &fg_pid);
+    }
+    const bool gate_fg = (fg != nullptr) && fg_pid != 0 && fg_pid == GetCurrentProcessId();
+    wchar_t cls[256]{};
+    wchar_t title[256]{};
+    if (fg != nullptr) {
+        GetClassNameW(fg, cls, 256);
+        GetWindowTextW(fg, title, 256);
+    }
+    airtype::log("门禁① 前台进程: %s", gate_fg ? "通过" : "未通过 -> 会隐藏图标");
+    airtype::log("  本进程 pid=%lu", static_cast<unsigned long>(GetCurrentProcessId()));
+    airtype::log("  前台 hwnd=%p pid=%lu class=%s title='%s'", static_cast<void*>(fg),
+                 static_cast<unsigned long>(fg_pid), utf16_to_utf8(cls).c_str(),
+                 utf16_to_utf8(title).c_str());
+
+    // 门禁②：活动键盘 TIP 是否是 AirType。
+    CComPtr<ITfInputProcessorProfileMgr> mgr;
+    hr = CoCreateInstance(CLSID_TF_InputProcessorProfiles, nullptr, CLSCTX_INPROC_SERVER,
+                          IID_ITfInputProcessorProfileMgr, reinterpret_cast<void**>(&mgr));
+    if (FAILED(hr) || !mgr) {
+        airtype::log_hr("门禁② CoCreateInstance", hr);
+        airtype::log("  查询失败时函数返回 true（放行）");
+        CoUninitialize();
+        return 1;
+    }
+    TF_INPUTPROCESSORPROFILE profile{};
+    hr = mgr->GetActiveProfile(GUID_TFCAT_TIP_KEYBOARD, &profile);
+    if (FAILED(hr)) {
+        airtype::log_hr("门禁② GetActiveProfile", hr);
+        airtype::log("  查询失败时函数返回 true（放行）");
+        CoUninitialize();
+        return 1;
+    }
+    const bool gate_active = profile.clsid == CLSID_AIRTYPE_TSF &&
+                             profile.guidProfile == GUID_AIRTYPE_PROFILE;
+    wchar_t clsid[64]{};
+    wchar_t prof[64]{};
+    StringFromGUID2(profile.clsid, clsid, 64);
+    StringFromGUID2(profile.guidProfile, prof, 64);
+    airtype::log("门禁② 活动键盘为 AirType: %s", gate_active ? "通过" : "未通过 -> 会隐藏图标");
+    airtype::log("  实际 clsid=%s profile=%s lang=0x%04X flags=0x%08lX",
+                 utf16_to_utf8(clsid).c_str(), utf16_to_utf8(prof).c_str(), profile.langid,
+                 profile.dwFlags);
+
+    // 结论：两个门禁都通过时才可能显示。
+    airtype::log("=== 结论：%s ===",
+                 (gate_fg && gate_active) ? "两道门禁均通过，图标应显示"
+                                          : "存在未通过的门禁，图标被主动隐藏");
+
+    mgr.Release();
+    CoUninitialize();
+    return (gate_fg && gate_active) ? 0 : 3;
 }
 
 int RunActivate(bool click) {
@@ -1155,7 +1229,7 @@ void usage(const char* exe) {
     printf("      %s --cursor    报告鼠标位置与其下的窗口\n", exe);
     printf("      %s --uia       用 UI Automation 报告鼠标下的控件类型（只读）\n", exe);
     printf("      %s --shotfg <out.bmp>  抓整块屏幕，用于核对落字结果\n", exe);
-    printf("      %s --status-preview <out.bmp>  预览悬浮状态图标并抓屏\n", exe);
+    printf("      %s --status-preview <out.bmp> [--level 0~1000]  预览悬浮状态图标并抓屏\n", exe);
 }
 
 }  // namespace
@@ -1172,6 +1246,7 @@ int main(int argc, char** argv) {
     bool deactivate = false;
     bool enable_profile = false;
     bool disable_profile = false;
+    bool gate_diag = false;
     bool click = false;
     // DeactivateProfile 不接受 TF_IPPMF_DONTCARECURRENTINPUTLANGUAGE（会 E_INVALIDARG）。
     DWORD deactivate_flags = 0;
@@ -1179,6 +1254,7 @@ int main(int argc, char** argv) {
     bool uia = false;
     std::string shotfg_path;
     std::string status_preview_path;
+    int status_preview_level = 0;
 
     for (int i = 1; i < argc; ++i) {
         if (strcmp(argv[i], "--write") == 0 && i + 1 < argc) {
@@ -1189,6 +1265,8 @@ int main(int argc, char** argv) {
             use_self_window = true;
         } else if (strcmp(argv[i], "--marshal") == 0) {
             marshal_test = true;
+        } else if (strcmp(argv[i], "--gate-diag") == 0) {
+            gate_diag = true;
         } else if (strcmp(argv[i], "--activate") == 0) {
             activate = true;
         } else if (strcmp(argv[i], "--deactivate") == 0) {
@@ -1209,6 +1287,8 @@ int main(int argc, char** argv) {
             shotfg_path = argv[++i];
         } else if (strcmp(argv[i], "--status-preview") == 0 && i + 1 < argc) {
             status_preview_path = argv[++i];
+        } else if (strcmp(argv[i], "--level") == 0 && i + 1 < argc) {
+            status_preview_level = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--dllselftest") == 0 && i + 1 < argc) {
             dll_selftest = argv[++i];
         } else if (strcmp(argv[i], "--shot") == 0 && i + 1 < argc) {
@@ -1231,7 +1311,7 @@ int main(int argc, char** argv) {
         return RunShotFg(shotfg_path);
     }
     if (!status_preview_path.empty()) {
-        return RunStatusPreview(status_preview_path);
+        return RunStatusPreview(status_preview_path, status_preview_level);
     }
     if (marshal_test) {
         airtype::log("=== AirType HiddenWindow marshal 测试 ===");
@@ -1246,6 +1326,9 @@ int main(int argc, char** argv) {
     }
     if (disable_profile) {
         return RunDisable();
+    }
+    if (gate_diag) {
+        return RunGateDiagnostic();
     }
     if (activate) {
         return RunActivate(click);

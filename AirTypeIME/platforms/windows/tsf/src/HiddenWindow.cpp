@@ -20,7 +20,8 @@ HiddenWindow* HiddenWindow::From(HWND hwnd) {
     return reinterpret_cast<HiddenWindow*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
 }
 
-bool HiddenWindow::Create(const wchar_t* title, Handler handler, CommandHandler refresh) {
+bool HiddenWindow::Create(const wchar_t* title, Handler handler, CommandHandler refresh,
+                          LevelHandler level) {
     if (hwnd_.load(std::memory_order_relaxed) != nullptr) {
         return true;
     }
@@ -50,6 +51,7 @@ bool HiddenWindow::Create(const wchar_t* title, Handler handler, CommandHandler 
     SetWindowLongPtrW(created, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(this));
     handler_ = std::move(handler);
     refresh_ = std::move(refresh);
+    level_ = std::move(level);
     return true;
 }
 
@@ -111,6 +113,14 @@ LRESULT CALLBACK HiddenWindow::WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
     if (msg == AirTypeMessages::Get().refreshStatus) {
         if (self->refresh_) {
             self->refresh_();
+        }
+        return 0;
+    }
+
+    // Rust 音频线程投递的音量电平：wParam 直接带毫电平，无指针所有权问题。
+    if (msg == AirTypeMessages::Get().level) {
+        if (self->level_) {
+            self->level_(static_cast<int>(wp));
         }
         return 0;
     }

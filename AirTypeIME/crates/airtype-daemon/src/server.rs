@@ -18,6 +18,7 @@ use airtype_core::{Config, Frame, FrameKind, Pipeline, PipelineEvent, Timings};
 use crate::engines;
 use crate::inject::{build_injector, TextInjector};
 use crate::registry::Registry;
+use crate::LevelCallback;
 use crate::PartialCallback;
 use crate::TextCallback;
 
@@ -52,6 +53,8 @@ struct ServerState {
     injector: Arc<dyn TextInjector>,
     on_text: TextCallback,
     on_partial: PartialCallback,
+    /// 音频电平通知（毫电平 0~1000），外壳用来画音量填充。
+    on_level: LevelCallback,
     /// 设备状态快照，给设置页面用。
     registry: Arc<Registry>,
 }
@@ -62,6 +65,7 @@ pub async fn run_server(
     registry: Arc<Registry>,
     on_text: TextCallback,
     on_partial: PartialCallback,
+    on_level: LevelCallback,
     mut shutdown: oneshot::Receiver<()>,
 ) -> anyhow::Result<()> {
     let requested: SocketAddr = format!("{}:{}", config.server.bind, config.server.port)
@@ -96,6 +100,7 @@ pub async fn run_server(
         injector,
         on_text,
         on_partial,
+        on_level,
         registry,
     });
 
@@ -161,6 +166,20 @@ async fn handle_connection(
                     }
                 };
                 let seq = frame.seq;
+
+                // 音量可视化：在收帧处直接算电平，不经 pipeline。
+                // 流式模式下 pipeline 会把多帧合并成一个 Partial、不产出 Appended
+                // 事件，走事件通道会丢掉大半电平；这里按原始 AUDIO 帧算最稳。
+                // PTT 结束/取消补一次 0，让图标填充回落（之后没有新帧了）。
+                match frame.kind {
+                    FrameKind::Audio => (state.on_level)(
+                        airtype_core::audio::frame_level(&frame.payload) as i32,
+                    ),
+                    // -1 是「录完了」，与句中的静音帧(0)区分开，让外壳立刻回落填充。
+                    FrameKind::End | FrameKind::Cancel => (state.on_level)(-1),
+                    _ => {}
+                }
+
                 // END/CANCEL 到达时刻是「松键」的服务端近似，用来算端到端总耗时。
                 let end_at = if matches!(frame.kind, FrameKind::End | FrameKind::Cancel) {
                     Some(Instant::now())

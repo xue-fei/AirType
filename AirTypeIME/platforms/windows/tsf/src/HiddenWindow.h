@@ -17,6 +17,8 @@ class HiddenWindow {
 public:
     using Handler = std::function<void(AirTypePayload*)>;
     using CommandHandler = std::function<void()>;
+    /// 音量电平（毫电平 0~1000）在 STA 线程上的回调。
+    using LevelHandler = std::function<void(int)>;
 
     HiddenWindow() = default;
     ~HiddenWindow();
@@ -26,7 +28,9 @@ public:
 
     /// 创建隐藏窗口。必须在目标进程的 UI（STA）线程上调用。
     /// refresh：后台轮询线程投递 RefreshStatus 时在 STA 线程回调，用于重新定位图标。
-    bool Create(const wchar_t* title, Handler handler, CommandHandler refresh = {});
+    /// level：Rust 音频线程投递 Level 消息时在 STA 线程回调，参数为毫电平 0~1000。
+    bool Create(const wchar_t* title, Handler handler, CommandHandler refresh = {},
+                LevelHandler level = {});
     void Destroy();
 
     HWND Handle() const { return hwnd_.load(std::memory_order_relaxed); }
@@ -40,6 +44,7 @@ private:
     std::atomic<HWND> hwnd_{nullptr};
     Handler handler_;
     CommandHandler refresh_;
+    LevelHandler level_;
     wchar_t class_name_[64]{};
 };
 

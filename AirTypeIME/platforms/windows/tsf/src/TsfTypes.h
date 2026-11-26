@@ -26,6 +26,9 @@ struct AirTypeMessages {
     // 后台轮询线程投递到隐藏窗口，让 STA 线程重新定位状态图标。
     // 用注册消息而非 WM_APP+n，理由同 text/partial（防跨进程指针混淆）。
     UINT refreshStatus = 0;
+    // Rust 音频线程投递音频电平（wParam = 毫电平 0~1000），
+    // STA 线程据此更新状态图标的音量填充。无数荷指针，wParam 直接带值。
+    UINT level = 0;
 
     static const AirTypeMessages& Get() {
         static AirTypeMessages instance = [] {
@@ -34,6 +37,7 @@ struct AirTypeMessages {
             m.partial = RegisterWindowMessageW(L"AirTypeTsf.Partial");
             m.shutdown = RegisterWindowMessageW(L"AirTypeTsf.Shutdown");
             m.refreshStatus = RegisterWindowMessageW(L"AirTypeTsf.RefreshStatus");
+            m.level = RegisterWindowMessageW(L"AirTypeTsf.Level");
             return m;
         }();
         return instance;

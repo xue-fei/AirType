@@ -2,7 +2,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use airtype_core::Config;
-use airtype_daemon::{run_server, run_web, PartialCallback, Registry, TextCallback};
+use airtype_daemon::{run_server, run_web, LevelCallback, PartialCallback, Registry, TextCallback};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -76,7 +76,12 @@ async fn main() -> anyhow::Result<()> {
         tracing::info!("[web] enabled = false，跳过设置页面");
     }
 
-    run_server(config, registry, on_text, on_partial, stop_rx).await
+    // 命令行 daemon 没有外壳可画音量，只把电平打进 trace 日志，便于排查。
+    let on_level: LevelCallback = Arc::new(|level: i32| {
+        tracing::trace!(level, "音频电平");
+    });
+
+    run_server(config, registry, on_text, on_partial, on_level, stop_rx).await
 }
 
 /// 给 anyhow 的 Context 加一条带路径的说明，避免污染主流程。

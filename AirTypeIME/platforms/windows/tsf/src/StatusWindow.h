@@ -12,6 +12,10 @@
 
 namespace airtype {
 
+/// 状态图标直径（逻辑像素）。圆形单麦克风图标，无文字。
+/// TsfTextService 的窗口兜底也要用同一个值，故放在头文件。
+constexpr int kStatusIconSize = 40;
+
 class StatusWindow {
 public:
     StatusWindow() = default;
@@ -32,6 +36,10 @@ public:
     /// 焦点离开文本区时隐藏图标（窗口保留，下次定位成功再显示）。
     void Hide();
 
+    /// 设置音量电平（毫电平 0~1000），圆形内部按比例从底部向上填充绿色。
+    /// 0 表示静音（无填充）。只在数值变化时重绘。
+    void SetLevel(int milli);
+
     bool Valid() const { return hwnd_ != nullptr; }
 
     /// 当前定位请求的代次。每次发起查询前递增；DoEditSession 执行时比对，
@@ -39,6 +47,14 @@ public:
     /// 只在 STA 线程写、STA 线程读；用 atomic 是因为 Deactivate/析构可能从
     /// 其他线程观测状态。
     std::atomic<LONG> generation{0};
+
+    /// 窗口是否仍然有效。Destroy() 立刻置 false。
+    ///
+    /// 为什么必需：定位查询走的是 TF_ES_ASYNC，RequestEditSession 返回后会话
+    /// 仍排在队列里，而它的 CaretQuerySession 持有本对象的裸指针。若此时
+    /// Deactivate() 调 Destroy()，回调再访问 FollowCaret/Hide 就是 use-after-free。
+    /// 回调入口先查这个标志即可安全放弃（窗口都没了，本来也无事可做）。
+    std::atomic<bool> alive{true};
 
 private:
     static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp);
@@ -56,6 +72,9 @@ private:
     /// 高频轮询下避免无谓的窗口位置变更与桌面合成。
     int last_x_ = INT_MIN;
     int last_y_ = INT_MIN;
+
+    /// 当前音量毫电平（0~1000）。只影响 Render 里的绿色填充高度。
+    int level_milli_ = 0;
 };
 
 }  // namespace airtype

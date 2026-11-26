@@ -77,6 +77,31 @@ impl PcmBuffer {
     }
 }
 
+/// 一帧 S16LE PCM 的归一化电平，单位「毫电平」：0 = 静音，1000 = 满幅。
+///
+/// 先算 RMS，再转 dBFS 做线性映射：**-60 dB 记 0、0 dB 记 1000**。
+/// 为什么不用线性 RMS：正常说话大约 -30 dBFS（RMS≈0.03），线性映射只能占到
+/// 3% 高度，图标几乎不动；对数映射后同一句话能到 500，视觉上才跟得上音量。
+/// 全程静音时 RMS 为 0，`max(1e-6)` 把 -120 dB 的 log 兜住，结果为 0。
+///
+/// 返回整数而非 f32：`PipelineEvent` 派生了 `Eq`（f32 不实现 Eq），
+/// 且跨 ABI 传给 C++ 时整数比浮点更省心。
+pub fn frame_level(bytes: &[u8]) -> u16 {
+    let count = bytes.len() / 2;
+    if count == 0 {
+        return 0;
+    }
+    let mut sum = 0.0f64;
+    for pair in bytes.chunks_exact(2) {
+        let s = i16::from_le_bytes([pair[0], pair[1]]) as f64 / 32768.0;
+        sum += s * s;
+    }
+    let rms = (sum / count as f64).sqrt() as f32;
+    let db = 20.0 * rms.max(1e-6).log10();
+    let norm = ((db + 60.0) / 60.0).clamp(0.0, 1.0);
+    (norm * 1000.0).round() as u16
+}
+
 /// 生成标准 RIFF/WAVE（PCM, 16bit, mono）字节流，供命令式 ASR 引擎读取。
 pub fn encode_wav(samples: &[i16], sample_rate: u32) -> Vec<u8> {
     let data_len = (samples.len() * 2) as u32;

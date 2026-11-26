@@ -21,7 +21,8 @@
 
 namespace airtype {
 
-class TsfTextService : public ITfTextInputProcessorEx, public ITfThreadMgrEventSink {
+class TsfTextService : public ITfTextInputProcessorEx, public ITfThreadMgrEventSink,
+                       public ITfInputProcessorProfileActivationSink {
 public:
     TsfTextService();
 
@@ -29,6 +30,13 @@ public:
     STDMETHODIMP QueryInterface(REFIID riid, void** ppv) override;
     STDMETHODIMP_(ULONG) AddRef() override;
     STDMETHODIMP_(ULONG) Release() override;
+
+    // ITfInputProcessorProfileActivationSink：系统活动键盘变化时收到广播。
+    // 用它替代 GetActiveProfile 轮询——后者查的是调用线程（我们的 STA 线程
+    // 并非焦点线程），恒返回 AirType，导致切到其他输入法后图标不消失。
+    STDMETHODIMP OnActivated(DWORD dwProfileType, LANGID langid, REFCLSID clsid,
+                             REFGUID catid, REFGUID guidProfile, HKL hkl,
+                             DWORD dwFlags) override;
 
     // ITfTextInputProcessor
     STDMETHODIMP Activate(ITfThreadMgr* ptim, TfClientId tid) override;
@@ -48,11 +56,17 @@ public:
     /// 公开给 Rust 回调用的自由函数（userdata 传 this）。
     void PostText(std::wstring text, bool final);
 
+    /// 从 Rust 音频线程把电平投递到 STA 线程。level 为 0~1000 毫电平，
+    /// **-1 表示 PTT 结束**（需立即回落填充）。公开理由同 PostText。
+    void PostLevel(int level);
+
 private:
     ~TsfTextService();
 
     /// 隐藏窗口收到文本后调用（STA 线程）。
     void OnPayload(AirTypePayload* payload);
+    /// 隐藏窗口收到电平后调用（STA 线程）：平滑后写入状态图标。
+    void OnLevel(int level);
     /// 焦点到达时补写之前因「拿不到焦点文档」而缓存的文本。
     void FlushPending();
     /// 把文本写进当前输入框。返回 false 表示本帧没落地（缓存待焦点、
@@ -73,6 +87,7 @@ private:
     CComPtr<ITfThreadMgr> thread_mgr_;
     TfClientId client_id_ = 0;
     DWORD sink_cookie_ = 0;
+    DWORD profile_sink_cookie_ = 0;  // ITfInputProcessorProfileActivationSink
     bool active_ = false;
 
     HiddenWindow hidden_;
@@ -91,6 +106,11 @@ private:
     /// 焦点未就绪时缓存的文本，等 OnSetFocus 补写（都在 STA 线程，无需加锁）。
     std::wstring pending_text_;
     bool has_pending_ = false;
+
+    /// 音量平滑值（0.0~1.0）。只在 STA 线程读写。
+    /// 电平是 20ms 一帧的瞬时 RMS，直接用会让填充高度逐帧跳动；
+    /// 做指数平滑后上升快、下降慢，视觉上像真实电平表。
+    float level_smoothed_ = 0.0f;
 
     /// 当前焦点文档（来自事件回调），用于判断「已写入范围」是否还有效。
     CComPtr<ITfDocumentMgr> current_doc_;

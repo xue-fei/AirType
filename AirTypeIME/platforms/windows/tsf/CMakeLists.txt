@@ -87,7 +87,17 @@ target_link_libraries(airtype_tsf PRIVATE
     oleaut32
     uuid
     gdiplus
+    # UIAutomationCore：UIA 光标回退（Qt/Chromium 等自绘控件定位）需要。
+    UIAutomationCore
 )
+
+# AIRTYPE_TRACE_STATUS：定位链路追踪日志开关。默认关闭（高频路径），
+# 排查「图标不显示 / 跟随异常」时用 -DAIRTYPE_TRACE_STATUS=ON 打开，
+# 会打印每拍门禁判定与异步回调结果。
+option(AIRTYPE_TRACE_STATUS "打印状态图标定位链路的逐拍日志" OFF)
+if(AIRTYPE_TRACE_STATUS)
+    target_compile_definitions(airtype_tsf PRIVATE AIRTYPE_TRACE_STATUS)
+endif()
 
 set_target_properties(airtype_tsf PROPERTIES
     LIBRARY_OUTPUT_DIRECTORY "${AIRTYPE_TSF_OUT_DIR}"
