@@ -514,9 +514,14 @@ public:
         CComPtr<ITfRange> selected;  // 复用取到的选区，供多次回退
 
         // ① 首选 TSF GetTextExt：把选区折叠到末端当插入符，取屏幕矩形。
+        //
+        // 注意必须用 ITfContext::GetActiveView，不能 QueryInterface(IID_ITfContextView)：
+        // ITfContextView 不在 ITfContext 的继承链上，QI 永远返回 E_NOINTERFACE，
+        // 结果整条主路径被静默跳过、全部落到 UIA 兜底。Chromium（Chrome/WorkBuddy）
+        // 的 UIA provider 不提供 range 的 bounding rect，最后只能拿到整个输入框矩形，
+        // 图标因此落在输入框正中而不是光标处。
         CComPtr<ITfContextView> view;
-        const HRESULT view_hr =
-            ctx_->QueryInterface(IID_ITfContextView, reinterpret_cast<void**>(&view));
+        const HRESULT view_hr = ctx_->GetActiveView(&view);
 
         TF_SELECTION sel{};
         ULONG fetched = 0;
