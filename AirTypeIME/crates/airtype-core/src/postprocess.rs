@@ -45,6 +45,9 @@ impl PostProcessor {
         if self.cfg.normalize_numbers {
             s = normalize_fullwidth(&s);
         }
+        if self.cfg.normalize_english_case {
+            s = normalize_english_case(&s);
+        }
         if self.cfg.collapse_whitespace {
             s = remove_cjk_spaces(&s);
         }
@@ -94,6 +97,51 @@ fn trim_fillers(input: &str) -> String {
 
 /// 全角数字与全角字母转半角；中文标点保留（中文输入需要它们）。
 /// 中文数字（"一二三"）不做转换，避免误改语义。
+/// 把 ASR 输出里"全大写的英文词"还原成正常大小写。
+///
+/// 为什么需要：zipformer 双语模型的英文词表本身是大写（LIBRI 风格），
+/// 于是 `Today is` 出来是 `TODAY IS`，`Monday` 出来是 `MONDAY`，整段像在喊。
+///
+/// 规则：只处理**长度 ≥ 2 且全大写**的纯字母词，转成"首字母大写 + 其余小写"；
+/// 单字母 `I` / `A` 和本来就是混合大小写的词（`iPhone`、`Monday`）原样保留。
+/// 不做句子级断句——识别结果没有标点，猜句子边界只会猜错。
+fn normalize_english_case(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut word = String::new();
+
+    fn flush(word: &mut String, out: &mut String) {
+        if word.is_empty() {
+            return;
+        }
+        let all_alpha = word.chars().all(|c| c.is_ascii_alphabetic());
+        let all_upper = word.chars().all(|c| !c.is_ascii_lowercase());
+        if all_alpha && word.len() >= 2 && all_upper {
+            let mut chars = word.chars();
+            if let Some(first) = chars.next() {
+                out.push(first); // 本来已是大写，直接保留
+                out.extend(chars.flat_map(|c| c.to_lowercase()));
+            }
+        } else {
+            // 混合大小写（iPhone）、单字母（I/A）、含数字的词一律原样保留。
+            out.push_str(word);
+        }
+        word.clear();
+    }
+
+    for ch in input.chars() {
+        // 数字也算词内字符：否则 "MP3" 会被拆成 "MP" + "3"，
+        // "MP" 又被当成全大写词转成 "Mp"，结果 "Mp3"。
+        if ch.is_ascii_alphanumeric() {
+            word.push(ch);
+        } else {
+            flush(&mut word, &mut out);
+            out.push(ch);
+        }
+    }
+    flush(&mut word, &mut out);
+    out
+}
+
 fn normalize_fullwidth(s: &str) -> String {
     s.chars()
         .map(|c| match c {
@@ -186,6 +234,7 @@ mod tests {
             normalize_numbers: false,
             ensure_punctuation: false,
             collapse_whitespace: false,
+            normalize_english_case: false,
         };
         assert_eq!(PostProcessor::new(cfg).process("嗯 你好"), "嗯 你好");
     }
@@ -210,5 +259,18 @@ mod tests {
             default_pp().process("开饭时间早上9点至下午5点。"),
             "开饭时间早上9点至下午5点。"
         );
+    }
+
+    #[test]
+    fn restores_english_case() {
+        // zipformer 的英文词表是大写，出来是 TODAY IS，要还原成 Today Is。
+        assert_eq!(
+            normalize_english_case("昨天是 MONDAY TODAY IS LIBR"),
+            "昨天是 Monday Today Is Libr"
+        );
+        // 单字母 I / A 不该被小写，混合大小写的词也不动。
+        assert_eq!(normalize_english_case("I am A iPhone"), "I am A iPhone");
+        // 含数字的词原样保留，别把 ES 之外的东西搅乱。
+        assert_eq!(normalize_english_case("MP3 WAV"), "MP3 Wav");
     }
 }

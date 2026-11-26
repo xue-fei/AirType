@@ -146,6 +146,13 @@ pub struct PostProcessConfig {
     pub ensure_punctuation: bool,
     #[serde(default = "yes")]
     pub collapse_whitespace: bool,
+    /// 英文全大写还原成正常大小写。
+    ///
+    /// zipformer 双语模型的英文 token 词表本身是大写（LIBRI 风格），
+    /// 识别结果会是 `TODAY IS` 这种全大写。打开后按"每个词首字母大写、
+    /// 其余小写"归一（`TODAY` → `Today`），单字母 `I` / `A` 保持原样。
+    #[serde(default = "yes")]
+    pub normalize_english_case: bool,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -296,6 +303,7 @@ defaults!(PostProcessConfig,
     normalize_numbers: true,
     ensure_punctuation: true,
     collapse_whitespace: true,
+    normalize_english_case: true,
 );
 defaults!(InjectConfig,
     mode: default_inject_mode(),
