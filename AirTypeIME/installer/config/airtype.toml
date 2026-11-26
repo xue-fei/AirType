@@ -36,17 +36,39 @@ provider = "cpu"
 modeling_unit = "cjkchar"
 decoding_method = "greedy_search"
 enable_endpoint = false
+# 热词表：每行一个词或短语，# 开头是注释（AirType 自己过滤，不会传给 sherpa）。
+# 用于修正模型系统性听错的词，典型是中英混说时中文短词被英文吞掉：
+# "Today is 礼拜二" 会被听成 "Today is Libr"。写进 hotwords.txt 后就能正确识别。
+# 注意：启用热词会自动切到 modified_beam_search 解码（更准但慢约 20%）。
+# 相对路径按「配置文件目录 → CWD」解析；留空 = 不启用。
+hotwords_file = "hotwords.txt"
+hotwords_score = 1.5
 
-# 边说边出字（partial 实时上屏）。默认关闭 = 松键后整段解码一次出文本；
-# 需要流式效果就把 enabled 改成 true（chunk_ms/replace 见 airtype-sherpa.toml）。
+# 流式语音降噪（DPDFNet）。嘈杂环境（办公室/车里）建议开；安静环境关掉
+# 可以省约 20MB 内存。模型 9.8MB，onnxruntime 走动态加载（见 runtime）。
+# 注意：降噪在 ASR 之前，音频电平表也基于降噪后的信号。
+[denoise]
+enabled = true
+model_dir = "../models/dpdfnet"
+model = "dpdfnet2.onnx"
+runtime = "../lib/onnxruntime.dll"
+
+# 边说边出字（partial 实时上屏）。默认开启：说的时候字就陆续出现，
+# 松键后只补最后一点。想要「松键后一次性给完整文本」，把 enabled 改成 false。
+# chunk_ms 是攒多久音频请求一次识别，越小越"逐字"，但解码更频繁（默认 200）。
 [streaming]
-enabled = false
+enabled = true
 
 [postprocess]
 trim_filler_words = true
 normalize_numbers = true
 ensure_punctuation = true
 collapse_whitespace = true
+# 英文全大写还原成首字母大写（zipformer 词表本身是大写，出来是 TODAY IS）。
+normalize_english_case = true
+# 中英之间补空格：`Today is礼拜二` → `Today is 礼拜二`。
+# 只处理含字母的英文词，`3月` / `第2种` 这类数字+中文不动。
+space_cjk_latin = true
 
 [inject]
 # none | clipboard_paste

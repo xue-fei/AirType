@@ -71,24 +71,51 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 ; regserver 的标志仍然有效——DllRegisterServer 用 GetModuleFileName 取自身
 ; 路径，注册表 InprocServer32 会自动指向新版本目录，老进程不受影响。
 Source: "dist\airtype_tsf.dll";       DestDir: "{app}\versions\{#VerDirName}"; Flags: ignoreversion regserver
-Source: "dist\airtype_ffi.dll";       DestDir: "{app}\versions\{#VerDirName}"; Flags: ignoreversion
+; ffi 单独放 lib、所有版本共用：它 20MB，若跟着版本目录走，每个删不掉的历史
+; 版本都会白占 20MB。外壳按 {app}\lib 优先、同目录兜底查找（见 FfiBridge.cpp）。
+Source: "dist\airtype_ffi.dll";       DestDir: "{app}\lib"; Flags: ignoreversion
 Source: "dist\airtype_tsf_probe.exe"; DestDir: "{app}\versions\{#VerDirName}"; Flags: ignoreversion
 ; 配置与工具不随版本走（用户改过的配置要保留）。
 Source: "config\airtype.toml";        DestDir: "{app}\config"; Flags: onlyifdoesntexist
+; 热词表：用户会自己编辑，所以只在不存在时投放，升级不覆盖。
+Source: "config\hotwords.txt";        DestDir: "{app}\config"; Flags: onlyifdoesntexist
 Source: "tools\simulate_voice.ps1";   DestDir: "{app}\tools"; Flags: ignoreversion
 Source: "tools\close_status.ps1";     DestDir: "{app}\tools"; Flags: ignoreversion
+Source: "tools\enable_streaming.ps1"; DestDir: "{app}\tools"; Flags: ignoreversion
+Source: "tools\configure_lan.ps1";   DestDir: "{app}\tools"; Flags: ignoreversion
+Source: "tools\enable_denoise.ps1";   DestDir: "{app}\tools"; Flags: ignoreversion
+Source: "tools\enable_hotwords.ps1";  DestDir: "{app}\tools"; Flags: ignoreversion
 Source: "VERIFY.md";                  DestDir: "{app}"; Flags: ignoreversion
 ; 内嵌 sherpa-onnx fp32 模型（encoder/decoder/joiner/tokens.txt/bpe.model，约 458MB）。
 ; 只打 fp32：resolve_model_files 明确跳过量化文件，int8 版约 209MB 不装。
 ; 缺模型时 engine = "sherpa" 会在输入法激活时报 model_dir 不是目录，无法识别。
+; 降噪模型（9.8MB）+ onnxruntime 动态库（19MB）。
+; 运行库放 lib 与 ffi 同级，ort 通过 [denoise] runtime 显式加载。
+Source: "..\models\dpdfnet\*"; DestDir: "{app}\models\dpdfnet"; Flags: ignoreversion recursesubdirs createallsubdirs
+; 这里**故意不加 ignoreversion**：onnxruntime.dll 只有升级 ORT 时才变，
+; 时间戳相同 Inno 就直接跳过，不去动被宿主进程锁着的文件（曾因此整包回滚、
+; 连带把 CLSID 注册一起删掉）。真需要更新时由 MoveAsideLockedFiles 让路。
+Source: "..\libs\onnxruntime.dll"; DestDir: "{app}\lib"
 ; onlyifdoesntexist：模型 458MB 且内容不变，已存在就跳过，重复安装省几分钟。
 Source: "..\models\sherpa-onnx-streaming-zipformer-bilingual-zh-en-2023-02-20\*"; DestDir: "{app}\models\sherpa-onnx-streaming-zipformer-bilingual-zh-en-2023-02-20"; Flags: ignoreversion onlyifdoesntexist recursesubdirs createallsubdirs; Excludes: "*.int8.onnx"
 
 [UninstallDelete]
 ; 旧版本目录不在 [Files] 里，Inno 不会自动删，必须显式声明。
 Type: filesandordirs; Name: "{app}\versions"
+Type: filesandordirs; Name: "{app}\lib"
 Type: filesandordirs; Name: "{app}\models"
 Type: filesandordirs; Name: "{app}\config"
+
+[Run]
+; 老配置里 [streaming] enabled 写死 false，而 config 是 onlyifdoesntexist（不覆盖
+; 用户修改），所以升级后仍是"松键后一次性出字"。这一步把它就地升为 true，
+; 脚本自身幂等（改完留标记，之后不再覆盖用户手动关闭的选择）。
+Filename: "powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{app}\tools\enable_streaming.ps1"""; Flags: runhidden waituntilterminated; StatusMsg: "升级流式识别配置..."
+
+; 老配置缺 [denoise] 段，补上（已有则不动，所以用户手动关掉降噪不会被重新打开）
+Filename: "powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{app}\tools\enable_denoise.ps1"""; Flags: runhidden waituntilterminated; StatusMsg: "启用流式降噪..."
+; 老配置的 [sherpa] 段缺热词两行，补上（已有则不动）
+Filename: "powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{app}\tools\enable_hotwords.ps1"""; Flags: runhidden waituntilterminated; StatusMsg: "配置热词表..."
 
 [Code]
 const
@@ -223,8 +250,15 @@ end;
 
 procedure MoveAsideLockedFiles;
 begin
+  // 旧「根目录平铺布局」的两个文件（历史残留）
   MoveAsideOne('airtype_tsf.dll');
   MoveAsideOne('airtype_ffi.dll');
+  // 共享核心：被任何宿主进程加载着就覆盖不了，先改名让路。
+  // 它只有一份，所以最多留一个 .old（下面 PurgeStaleFiles 会扫 lib 目录移走）。
+  MoveAsideOne('lib\airtype_ffi.dll');
+  // 降噪运行库同理：启用 [denoise] 的宿主进程（chrome/微信…）都会锁住它。
+  // 不加这一行时，覆盖失败会让整包回滚，并连带 DllUnregisterServer 清掉 CLSID。
+  MoveAsideOne('lib\onnxruntime.dll');
 end;
 
 // 从旧版「根目录平铺布局」升级上来时，清掉根目录那三个可执行产物。
@@ -419,6 +453,8 @@ begin
   nReg := 0;
   PurgePattern(Dir, '*.old*', nDel, nMoved, nReg);
   PurgePattern(Dir, 'is-*.tmp', nDel, nMoved, nReg);
+  // lib 目录下是 20MB 的共享 ffi，让路产生的 .old 必须一并移走，否则白占空间。
+  PurgePattern(ExpandConstant('{app}\lib'), '*.old*', nDel, nMoved, nReg);
   if Phase = '安装后' then
     PurgeOrphanUninstallers;
   // 注意：Format 的参数数组不能换行到行首——.iss 解析器会把行首的 '[' 误判为
@@ -490,6 +526,30 @@ begin
   Log(Format('版本目录清理：非当前 %d 个，删除 %d 个，保留 1 个', [Count, Removed]));
 end;
 
+// 局域网直连开关：只有安装时显式带 /LAN=1 才把 [server] bind 改成 0.0.0.0。
+//
+// 为什么做成参数而不是默认：0.0.0.0 意味着同网段任何机器都能连上语音接收端口
+// （无鉴权），不该作为默认安装态。AirMic 走 WiFi 直连 PC 时才需要。
+//   Setup.exe /SILENT /LAN=1
+procedure ApplyLanBind;
+var
+  Code: Integer;
+  Tool: string;
+begin
+  if ExpandConstant('{param:LAN|0}') <> '1' then
+    Exit;
+  Tool := ExpandConstant('{app}\tools\configure_lan.ps1');
+  if not FileExists(Tool) then
+  begin
+    Log('局域网配置脚本不存在，跳过');
+    Exit;
+  end;
+  Exec('powershell.exe',
+       '-NoProfile -ExecutionPolicy Bypass -File "' + Tool + '"',
+       '', SW_HIDE, ewWaitUntilTerminated, Code);
+  Log(Format('局域网直连配置 -> exit %d', [Code]));
+end;
+
 procedure CurStepChanged(CurStep: TSetupStep);
 begin
   if CurStep = ssInstall then
@@ -515,6 +575,8 @@ begin
     PurgeStaleFiles('安装后');
     // 保留最近 2 个版本（当前 + 上一个），更老的删掉。
     PruneOldVersions;
+    // 只有显式 /LAN=1 才把监听改成 0.0.0.0。
+    ApplyLanBind;
   end;
 end;
 

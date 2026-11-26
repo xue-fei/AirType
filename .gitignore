@@ -26,3 +26,11 @@ target/
 *.user
 .DS_Store
 Thumbs.db
+
+# 降噪验证用的音频（clean/noisy/enhanced，可由 dpdfnet_test/verify.py 重新生成）
+dpdfnet_test/
+
+# 临时测试配置与安装日志
+dt_*.toml
+setup_*.log
+hw_test.txt

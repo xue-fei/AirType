@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     用 Inno Setup 6 把 dist 里的产物编译成带正规向导/卸载器的安装 EXE。
 
@@ -62,6 +62,13 @@ foreach ($m in $modelRequired) {
         Fail "缺少模型文件：$p`n模型未随安装包分发，请先下载/放置到 $modelDir"
     }
 }
+# 降噪资产：模型 9.8MB + onnxruntime.dll 19MB，缺一个都会让 [Files] 编译失败
+$denoiseDir = Join-Path (Split-Path -Parent $Root) 'models\dpdfnet'
+$denoiseModel = Join-Path $denoiseDir 'dpdfnet2.onnx'
+$ortDll = Join-Path (Split-Path -Parent $Root) 'libs\onnxruntime.dll'
+if (-not (Test-Path -LiteralPath $denoiseModel)) { Fail "缺少降噪模型：$denoiseModel" }
+if (-not (Test-Path -LiteralPath $ortDll)) { Fail "缺少 onnxruntime.dll：$ortDll" }
+Log '降噪资产就位（dpdfnet2.onnx + onnxruntime.dll）' 'Cyan'
 $modelSize = [math]::Round((Get-ChildItem -LiteralPath $modelDir -File |
             Where-Object { $_.Name -notlike '*.int8.onnx' } |
             Measure-Object Length -Sum).Sum / 1MB, 0)
@@ -91,3 +98,4 @@ if ($sig.Status -eq 'Valid') {
 } else {
     Log "安装包未签名或签名无效（$($sig.Status)）；如需签名请用 sign.ps1。" 'DarkYellow'
 }
+
