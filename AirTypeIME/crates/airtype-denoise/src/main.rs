@@ -96,14 +96,20 @@ fn main() {
     // 带参数时只做「降噪 → 存盘」，方便把结果直接喂给 ASR 做 A/B。
     if let Some(inp) = std::env::args().nth(1) {
         let (isr, data) = read_wav(&PathBuf::from(&inp));
-        let mut d = airtype_denoise::StreamDenoiser::new(m.clone());
+        // 第二个参数：attn_limit_db（省略 = 纯模型输出）
+        let attn: Option<f32> = std::env::args().nth(2).and_then(|v| v.parse().ok());
+        let mut d = airtype_denoise::StreamDenoiser::new(m.clone()).with_attn_limit(attn);
         let mut out = airtype_denoise::StreamDenoiser::process(&mut d, &data);
         out.extend(airtype_denoise::StreamDenoiser::flush(&mut d));
         let stem = PathBuf::from(&inp)
             .file_stem()
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_else(|| "out".into());
-        let dst = test.join(format!("enh_{stem}.wav"));
+        let suffix = match attn {
+            Some(v) => format!("_a{v}"),
+            None => String::new(),
+        };
+        let dst = test.join(format!("enh_{stem}{suffix}.wav"));
         write_wav(&dst, isr, &out);
         println!("已写出 {}（{} 样本）", dst.display(), out.len());
         return;

@@ -175,9 +175,10 @@ async fn handle_connection(
         .context("build pipeline")?;
     // 每条连接一个降噪器：RNN/OLA 状态必须独立，否则两路语音互相污染。
     if let Some(model) = &state.denoise {
-        pipeline = pipeline.with_denoiser(Box::new(airtype_denoise::StreamDenoiser::new(
-            model.clone(),
-        )));
+        pipeline = pipeline.with_denoiser(Box::new(
+            airtype_denoise::StreamDenoiser::new(model.clone())
+                .with_attn_limit(state.config.denoise.attn_limit_db),
+        ));
     }
     let pipeline = Arc::new(Mutex::new(pipeline));
     let mut trace = StreamTrace::default();

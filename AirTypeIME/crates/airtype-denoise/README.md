@@ -50,18 +50,58 @@ let tail = d.flush();           // 补齐尾部
 
 ## 接入位置
 
-`Session` 的 Audio 分支先降噪再入库（`FrameKind::Audio` → `PcmBuffer`），
-END 时调 `flush()` 补齐尾部。这样 ASR 和音量表看到的都是增强后的信号。
+`Pipeline::on_frame` 的**入口**（不是 Session）：构造增强帧后同时喂给
+Session（离线缓冲）与流式 ASR。
+
+> 这点踩过坑：最初挂在 `Session` 的 Audio 分支，只影响离线路径 ——
+> `on_frame_streaming` 直接用原始 `frame.payload` 喂流式 ASR，于是
+> 「六档 SNR 开/关降噪识别结果逐字相同」，差点得出"降噪对 ASR 无帮助"的错误结论。
 
 - core 只定义 `trait FrameDenoiser`（不依赖 native），daemon 按 `[denoise] enabled` 注入
 - 每条 WebSocket 连接 new 一个 `StreamDenoiser`（RNN/OLA 状态必须独立）
 - 模型加载失败只降级为"不降噪"，不影响 ASR
 
+## 抑制上限 attn_limit_db（关键）
+
+模型本身没有可调参数，但官方 `audio.py::apply_attn_limit` 在**频谱域**做干湿混合：
+
+```python
+alpha = 10 ** (-attn_limit_db / 20)
+out = alpha * noisy_spec + (1 - alpha) * enhanced_spec
+```
+
+`0` = 完全不降噪，数值越大越接近纯模型输出。实现时有两个坑：
+
+1. **alpha == 1 不能跳过混合**。跳过会变成"用纯模型输出"，语义正好反了
+   （第一版就是这么错的：`attn=0` 反而最狠）。
+2. **必须用 4 帧前的输入谱**。官方 `ATTN_LIMIT_NOISY_FRAME_OFFSET = 4`：
+   模型输出比输入谱晚 4 帧（640 样本），拿当前帧去混等于把两个错位信号叠加，
+   会产生梳状失真（实测 SNR 从 26dB 掉到 0dB）。所以 `StreamDenoiser` 缓存
+   最近 4 帧输入谱。
+
+### 实测：最优值是 3
+
+同一条 10 秒中英混说，CER 相对干净音频（越低越好）：
+
+| 输入 | 不降噪 | attn=0 | **attn=3** | attn=6 | attn=12 | 全降噪 |
+|---|---|---|---|---|---|---|
+| clean | 0% | 0% | **0%** | **0%** | 2.4% | 26.2% |
+| 15 dB | 31.0% | 31.0% | **19.0%** | 11.9% | 19.0% | 16.7% |
+| 5 dB | 69.0% | 66.7% | **21.4%** | 42.9% | 35.7% | 31.0% |
+| 平均 | 33.3% | 32.6% | **13.5%** | 18.3% | 19.0% | 24.6% |
+
+结论：
+- **attn=3 是甜点**：干净语音零损失，5dB 噪声下 CER 从 69% 降到 21%
+- **全降噪（None/几百 dB）对干净语音是灾难**（0% → 26%），不能作默认
+- 3~6 都可用，取 3 更稳（5dB 档明显更好）
+
+默认值即 `3.0`（`config.rs::default_attn_limit_db`），老配置不写这行也自动生效。
+
 ## 打包
 
 - 模型 `models\dpdfnet\dpdfnet2.onnx`（9.7MB）
 - 运行库 `lib\onnxruntime.dll`（18.4MB，**必须动态加载**）
-- 安装包从 275.7MB 增至 288.8MB
+- 安装包从 275.7MB 增至 288.9MB
 
 > **为什么必须动态加载**：`sherpa-onnx-sys` 用静态 CRT(MT) 且已静态打包了一份
 > onnxruntime，`ort` 若也静态链接会与它符号重定义 + CRT 不匹配（LNK2005 / LNK2038）。
@@ -69,8 +109,9 @@ END 时调 `flush()` 补齐尾部。这样 ASR 和音量表看到的都是增强
 ## 验证
 
 ```
-INFO airtype_daemon::server: 降噪已启用（DPDFNet）
-推 10dB 噪声音频 → 识别：昨天是 Monday After Tomorrow是星期三。
-PARTIAL 逐字：昨 → 昨天 → 昨天是 → 昨天是 Monday → ...
+# 默认 attn=3，daemon 内降噪
+clean.wav → 昨天是 Monday Today Is 礼拜二 The Day After Tomorrow 是星期三。   (与不降噪一致)
+snr5.wav  → 昨天是 Monday 礼拜二 Today After Tomorrow 是星期三。              (不降噪只有"Monday 吧是星期三。")
 ```
 
+`attn=0` 的 SNR 会精确还原出名义值（15.03 / 5.02 dB），说明 STFT/ISTFT 重建无损。

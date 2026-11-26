@@ -146,6 +146,23 @@ pub struct DenoiseConfig {
     /// （2.49M 参数，单线程 RTF 约 0.2）。
     #[serde(default = "default_denoise_model")]
     pub model: String,
+    /// 抑制上限（dB），对应官方 `apply_attn_limit`。
+    ///
+    /// - 不写/`None`：纯模型输出（降噪最狠）
+    /// - `0`：完全不降噪（等于旁路）
+    /// - `3`~`6`：干湿混合，对干净语音的损伤小而噪声段仍有收益
+    /// - 不写这一行 = 3.0（实测最稳的档位：干净语音 CER 0%，5dB 噪声 69%→21%）
+    ///
+    /// 实测（同一条 10s 中英混说，CER 相对干净音频）：
+    /// ```text
+    ///           原始   attn=0  attn=3  attn=6  attn=12  全降噪
+    /// clean      0%      0%      0%      0%     2.4%   26.2%
+    /// 15dB      31%     31%    19.0%   11.9%   19.0%   16.7%
+    ///  5dB      69%   66.7%   21.4%   42.9%   35.7%   31.0%
+    /// ```
+    /// 全降噪（几百 dB）对干净语音是灾难，所以默认不取 None。
+    #[serde(default = "default_attn_limit_db")]
+    pub attn_limit_db: Option<f32>,
     /// onnxruntime.dll 路径，同样相对配置文件目录解析。
     ///
     /// 为什么必须显式给：ort 走 load-dynamic，而 sherpa-onnx 已经静态打包了
@@ -341,6 +358,7 @@ defaults!(DenoiseConfig,
     model_dir: default_denoise_dir(),
     model: default_denoise_model(),
     runtime: default_denoise_runtime(),
+    attn_limit_db: default_attn_limit_db(),
 );
 defaults!(StreamingConfig,
     enabled: default_streaming_enabled(),
@@ -413,6 +431,10 @@ fn default_sherpa_decoding_method() -> String {
 }
 fn default_hotwords_score() -> f32 {
     1.5
+}
+
+fn default_attn_limit_db() -> Option<f32> {
+    Some(3.0)
 }
 
 fn default_denoise_dir() -> String {

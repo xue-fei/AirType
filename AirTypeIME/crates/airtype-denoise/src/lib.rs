@@ -234,22 +234,29 @@ impl DenoiseModel {
     }
 
     /// 一帧前向：时域帧 → 增强后的时域帧（长度均为 n_fft）。
-    fn forward_frame(&self, frame: &[f32], state: &mut [f32]) -> Result<Vec<f32>, DenoiseError> {
+    /// 分析 STFT：时域帧 → 交错谱 `[re, im, re, im, ...]`（长度 bins*2）。
+    fn analyze(&self, frame: &[f32]) -> Vec<f32> {
         let bins = self.n_fft / 2 + 1;
-
         let mut buf: Vec<Complex<f32>> = (0..self.n_fft)
             .map(|i| Complex::new(frame[i] * self.window[i], 0.0))
             .collect();
         self.fft.process(&mut buf);
-
-        // 交错成 [1,1,bins,2]（实、虚）
-        let mut inter: Vec<f32> = Vec::with_capacity(bins * 2);
+        let mut inter = Vec::with_capacity(bins * 2);
         for c in &buf[..bins] {
             inter.push(c.re);
             inter.push(c.im);
         }
+        inter
+    }
 
-        let spec_t = Tensor::from_array(([1usize, 1, bins, 2], inter))
+    /// 跑一帧 ONNX。`spec_inter` 是 `analyze` 的输出，返回增强后的交错谱。
+    fn run_spec(
+        &self,
+        spec_inter: &[f32],
+        state: &mut [f32],
+    ) -> Result<Vec<f32>, DenoiseError> {
+        let bins = self.n_fft / 2 + 1;
+        let spec_t = Tensor::from_array(([1usize, 1, bins, 2], spec_inter.to_vec()))
             .map_err(|e| DenoiseError::Infer(e.to_string()))?;
         let state_t = Tensor::from_array(([state.len()], state.to_vec()))
             .map_err(|e| DenoiseError::Infer(e.to_string()))?;
@@ -276,25 +283,29 @@ impl DenoiseModel {
             state.copy_from_slice(state_data);
             spec_vec = spec_data.to_vec();
         }
+        Ok(spec_vec)
+    }
 
-        // 补成共轭对称谱再逆变换
+    /// 合成 ISTFT：交错谱 → 时域帧（已乘合成窗，供 OLA 直接累加）。
+    ///
+    /// 逆变换用 320 点复数 IFFT + 手工补共轭对称，等价于 `np.fft.irfft`；
+    /// rustfft 不归一化，所以补 1/n。
+    fn synthesize(&self, spec_inter: &[f32]) -> Vec<f32> {
+        let bins = self.n_fft / 2 + 1;
         let mut full: Vec<Complex<f32>> = vec![Complex::new(0.0, 0.0); self.n_fft];
         for k in 0..bins {
-            full[k] = Complex::new(spec_vec[2 * k], spec_vec[2 * k + 1]);
+            full[k] = Complex::new(spec_inter[2 * k], spec_inter[2 * k + 1]);
         }
         for k in bins..self.n_fft {
             let m = self.n_fft - k;
-            full[k] = Complex::new(spec_vec[2 * m], -spec_vec[2 * m + 1]);
+            full[k] = Complex::new(spec_inter[2 * m], -spec_inter[2 * m + 1]);
         }
         self.ifft.process(&mut full);
-
-        // rustfft 逆变换不归一化，补 1/n；再乘合成窗
         let scale = 1.0 / self.n_fft as f32;
-        Ok(full
-            .iter()
+        full.iter()
             .enumerate()
             .map(|(i, c)| c.re * scale * self.window[i])
-            .collect())
+            .collect()
     }
 }
 
@@ -311,7 +322,16 @@ pub struct StreamDenoiser {
     pending: Vec<f32>,
     /// OLA 输出缓冲，长度 n_fft。
     ola: Vec<f32>,
+    /// 抑制上限（dB）。`None` = 全量降噪；数值越小越接近原始音频。
+    attn_limit_db: Option<f32>,
+    /// 最近几帧的输入谱，给 attn_limit 做延迟对齐用。
+    spec_hist: std::collections::VecDeque<Vec<f32>>,
 }
+
+/// 官方 `audio.py::ATTN_LIMIT_NOISY_FRAME_OFFSET`：模型输出比输入谱晚 4 帧
+/// （640 样本 = 40ms）。干湿混合必须拿 4 帧前的输入谱，否则两个错位信号叠加
+/// 会产生梳状失真 —— 实测会把 SNR 从 26dB 打到 0dB。
+const ATTN_OFFSET_FRAMES: usize = 4;
 
 impl StreamDenoiser {
     pub fn new(model: Arc<DenoiseModel>) -> Self {
@@ -322,7 +342,16 @@ impl StreamDenoiser {
             state,
             pending: Vec::with_capacity(n * 2),
             ola: vec![0.0; n],
+            attn_limit_db: None,
+            spec_hist: std::collections::VecDeque::with_capacity(ATTN_OFFSET_FRAMES + 1),
         }
+    }
+
+    /// 设置抑制上限。对应官方 `apply_attn_limit(attn_limit_db=...)`：
+    /// 0 表示完全不降噪，数值越大越接近纯模型输出。`None` 是纯模型输出。
+    pub fn with_attn_limit(mut self, db: Option<f32>) -> Self {
+        self.attn_limit_db = db;
+        self
     }
 
     /// 喂一段 S16LE 样本，返回本次已就绪的增强样本（hop 的整数倍，可能为空）。
@@ -371,6 +400,7 @@ impl StreamDenoiser {
         self.state = self.model.state_init.clone();
         self.pending.clear();
         self.ola.iter_mut().for_each(|v| *v = 0.0);
+        self.spec_hist.clear();
     }
 
     /// 推一帧，返回 hop 个样本。
@@ -379,7 +409,34 @@ impl StreamDenoiser {
         let hop = self.model.hop;
         let frame: Vec<f32> = self.pending[..n].to_vec();
 
-        let time = self.model.forward_frame(&frame, &mut self.state)?;
+        let spec_in = self.model.analyze(&frame);
+        let spec_e = self.model.run_spec(&spec_in, &mut self.state)?;
+
+        // attn_limit：`alpha*noisy + (1-alpha)*enhanced`，对应官方
+        // `apply_attn_limit`。alpha=1 表示完全不降噪，越小越接近纯模型输出。
+        let spec = match self.attn_limit_db {
+            Some(limit) => {
+                let alpha = 10f32.powf(-limit.clamp(0.0, 120.0) / 20.0);
+                let aligned: &[f32] = if self.spec_hist.len() >= ATTN_OFFSET_FRAMES {
+                    &self.spec_hist[self.spec_hist.len() - ATTN_OFFSET_FRAMES]
+                } else {
+                    // 冷启动不足 4 帧：先用当前帧顶上，偏差只影响前 40ms。
+                    &spec_in
+                };
+                aligned
+                    .iter()
+                    .zip(spec_e.iter())
+                    .map(|(nz, eh)| alpha * nz + (1.0 - alpha) * eh)
+                    .collect()
+            }
+            None => spec_e,
+        };
+        self.spec_hist.push_back(spec_in);
+        if self.spec_hist.len() > ATTN_OFFSET_FRAMES {
+            self.spec_hist.pop_front();
+        }
+
+        let time = self.model.synthesize(&spec);
 
         // OLA 直接累加：合成窗已在前向里乘过，COLA 保证前 hop 个样本即原信号。
         for i in 0..n {

@@ -52,6 +52,11 @@ enabled = true
 model_dir = "../models/dpdfnet"
 model = "dpdfnet2.onnx"
 runtime = "../lib/onnxruntime.dll"
+# 抑制上限（dB），对应官方 apply_attn_limit。
+# 0 = 完全不降噪；数值越大降噪越狠；省略这一行按 3.0 处理。
+# 实测最稳档位是 3：干净语音 CER 0%（几乎无损），5dB 噪声下 69% → 21%。
+# 别设成几十以上——纯模型输出对干净语音是灾难（CER 0% → 26%）。
+attn_limit_db = 3
 
 # 边说边出字（partial 实时上屏）。默认开启：说的时候字就陆续出现，
 # 松键后只补最后一点。想要「松键后一次性给完整文本」，把 enabled 改成 false。
