@@ -4,7 +4,6 @@
 use thiserror::Error;
 
 use crate::audio::{AudioError, PcmBuffer};
-use crate::denoise::FrameDenoiser;
 use crate::config::AudioConfig;
 use crate::protocol::{Frame, FrameKind, StartMeta, CODEC_PCM_S16LE};
 
@@ -55,8 +54,6 @@ pub struct Session {
     max_ms: u32,
     last_seq: Option<u16>,
     seq_warnings: u64,
-    /// 可选降噪器。装配在音频入口处，ASR 与音量表都基于增强后的信号。
-    denoiser: Option<Box<dyn FrameDenoiser>>,
 }
 
 impl Session {
@@ -68,13 +65,7 @@ impl Session {
             max_ms: cfg.max_utterance_ms,
             last_seq: None,
             seq_warnings: 0,
-            denoiser: None,
         }
-    }
-
-    /// 注入降噪器（daemon 按 `[denoise] enabled` 决定是否调用）。
-    pub fn set_denoiser(&mut self, d: Box<dyn FrameDenoiser>) {
-        self.denoiser = Some(d);
     }
 
     pub fn state(&self) -> SessionState {
@@ -124,18 +115,7 @@ impl Session {
                 if self.state != SessionState::Recording {
                     return Err(SessionError::NotStarted);
                 }
-                // 降噪放在入库前：后面 ASR 和音量表看到的都是增强后的信号。
-                let appended = match self.denoiser.as_mut() {
-                    Some(d) => match le_bytes_to_i16(&f.payload) {
-                        Ok(samples) => {
-                            let enhanced = d.process(&samples);
-                            self.buffer.append_samples(&enhanced, self.max_ms)
-                        }
-                        Err(e) => Err(e),
-                    },
-                    None => self.buffer.append_le_bytes(&f.payload, self.max_ms),
-                };
-                match appended {
+                match self.buffer.append_le_bytes(&f.payload, self.max_ms) {
                     Ok(n) => Ok(SessionEvent::Appended {
                         samples: n,
                         total_ms: self.buffer.duration_ms(),
@@ -153,17 +133,6 @@ impl Session {
                     return Ok(SessionEvent::Ignored);
                 }
                 self.state = SessionState::Idle;
-                // 降噪器可能还压着首窗填充/尾部样本，冲出来再交付，
-                // 否则末尾几个字会缺一截（约 10~40ms）。
-                if let Some(d) = self.denoiser.as_mut() {
-                    let tail = d.flush();
-                    if !tail.is_empty() {
-                        if let Err(e) = self.buffer.append_samples(&tail, self.max_ms) {
-                            // 超长就丢掉这点尾巴，不能因为余量让整段失败
-                            tracing::warn!("降噪尾部追加失败，丢弃 {} 样本: {e}", tail.len());
-                        }
-                    }
-                }
                 Ok(SessionEvent::Utterance {
                     samples: self.buffer.take(),
                     sample_rate: self.sample_rate,
@@ -178,17 +147,6 @@ impl Session {
             _ => Ok(SessionEvent::Ignored),
         }
     }
-}
-
-/// S16LE 字节流转 i16 样本。奇数字节属于协议错误，交给上层报。
-fn le_bytes_to_i16(bytes: &[u8]) -> Result<Vec<i16>, AudioError> {
-    if bytes.len() % 2 != 0 {
-        return Err(AudioError::OddPayload(bytes.len()));
-    }
-    Ok(bytes
-        .chunks_exact(2)
-        .map(|p| i16::from_le_bytes([p[0], p[1]]))
-        .collect())
 }
 
 #[cfg(test)]

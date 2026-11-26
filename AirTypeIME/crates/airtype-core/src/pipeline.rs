@@ -15,10 +15,10 @@ use std::time::Instant;
 use thiserror::Error;
 
 use crate::asr::{AsrEngine, AsrError};
-use crate::audio::AudioError;
+use crate::audio::{i16_to_le_bytes, le_bytes_to_i16, AudioError};
 use crate::config::Config;
 use crate::postprocess::PostProcessor;
-use crate::protocol::{Frame, Timings, MAX_PAYLOAD};
+use crate::protocol::{Frame, FrameKind, Timings, MAX_PAYLOAD};
 use crate::session::{Session, SessionError, SessionEvent};
 use crate::streaming::{AsrStream, StreamingAsr};
 
@@ -85,14 +85,18 @@ pub struct Pipeline {
     replace: bool,
     last_timing: Option<Timings>,
     stream_asr_ms: u64,
+    /// 可选降噪器。**必须挂在这里而不是 Session 里**：流式识别直接吃
+    /// `frame.payload`，只在 Session 降噪等于对 ASR 完全无效（实测六档 SNR
+    /// 开/关降噪结果逐字相同，就是这个原因）。
+    denoiser: Option<Box<dyn crate::denoise::FrameDenoiser>>,
 }
 
 impl Pipeline {
     /// 注入降噪器（builder 风格，不改 `new` 的签名以免波及所有调用点）。
     ///
-    /// 降噪挂在 Session 的音频入口，所以必须在收到第一帧之前调用。
+    /// 必须在收到第一帧之前调用：降噪状态（RNN/OLA）是按流累积的。
     pub fn with_denoiser(mut self, d: Box<dyn crate::denoise::FrameDenoiser>) -> Self {
-        self.session.set_denoiser(d);
+        self.denoiser = Some(d);
         self
     }
 
@@ -116,6 +120,7 @@ impl Pipeline {
             replace: cfg.streaming.replace,
             last_timing: None,
             stream_asr_ms: 0,
+            denoiser: None,
         })
     }
 
@@ -139,6 +144,30 @@ impl Pipeline {
 
     pub fn on_frame(&mut self, f: &Frame) -> Result<PipelineEvent, PipelineError> {
         self.last_timing = None;
+        // 降噪必须在分支之前做：流式识别直接用 frame.payload 喂 ASR，
+        // 只降噪 Session 那条路等于「离线路径安静了、ASR 一点没变」。
+        // 增强后的帧同时供 Session（离线/电平累计）与流式两条路使用。
+        let enhanced = if f.kind == FrameKind::Audio {
+            match self.denoiser.as_mut() {
+                Some(d) => match le_bytes_to_i16(&f.payload) {
+                    Ok(samples) => {
+                        let out = d.process(&samples);
+                        Some(Frame {
+                            kind: f.kind,
+                            flags: f.flags,
+                            seq: f.seq,
+                            payload: i16_to_le_bytes(&out),
+                        })
+                    }
+                    // 奇数字节复用 Session 的错误路径，这里保持原帧即可。
+                    Err(_) => None,
+                },
+                None => None,
+            }
+        } else {
+            None
+        };
+        let f = enhanced.as_ref().unwrap_or(f);
         let ev = self.session.on_frame(f)?;
         if self.streaming.is_some() {
             self.on_frame_streaming(f, ev)

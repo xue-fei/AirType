@@ -93,6 +93,22 @@ fn main() {
         py.len()
     );
 
+    // 带参数时只做「降噪 → 存盘」，方便把结果直接喂给 ASR 做 A/B。
+    if let Some(inp) = std::env::args().nth(1) {
+        let (isr, data) = read_wav(&PathBuf::from(&inp));
+        let mut d = airtype_denoise::StreamDenoiser::new(m.clone());
+        let mut out = airtype_denoise::StreamDenoiser::process(&mut d, &data);
+        out.extend(airtype_denoise::StreamDenoiser::flush(&mut d));
+        let stem = PathBuf::from(&inp)
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "out".into());
+        let dst = test.join(format!("enh_{stem}.wav"));
+        write_wav(&dst, isr, &out);
+        println!("已写出 {}（{} 样本）", dst.display(), out.len());
+        return;
+    }
+
     let t0 = std::time::Instant::now();
     let rust = denoise_offline(&m, &noisy);
     let dt = t0.elapsed().as_secs_f64();
@@ -106,6 +122,32 @@ fn main() {
     );
 
     write_wav(&test.join("enhanced_rust.wav"), sr, &rust);
+
+    // ---- 分片 vs 一次性：实时链路每帧只喂 320 样本（20ms），必须与整段等价 ----
+    {
+        let mut d2 = airtype_denoise::StreamDenoiser::new(m.clone());
+        let mut chunked: Vec<i16> = Vec::with_capacity(noisy.len());
+        for ch in noisy.chunks(320) {
+            chunked.extend(airtype_denoise::StreamDenoiser::process(&mut d2, ch));
+        }
+        let n = chunked.len().min(rust.len());
+        let mut mdiff = 0i32;
+        for i in 0..n {
+            mdiff = mdiff.max((chunked[i] as i32 - rust[i] as i32).abs());
+        }
+        println!(
+            "\n== 分片(320/次) vs 一次性 ==\n  长度 chunked={} oneshot={}\n  最大偏差={}",
+            chunked.len(),
+            rust.len(),
+            mdiff
+        );
+        if n > 0 {
+            let rms = |v: &[i16]| {
+                (v[..n].iter().map(|s| (*s as f64) * (*s as f64)).sum::<f64>() / n as f64).sqrt()
+            };
+            println!("  RMS chunked={:.0} oneshot={:.0}", rms(&chunked), rms(&rust));
+        }
+    }
 
     // 模型输出相对输入滞后 640 个样本（内部延迟）。流式版不丢（实时无感），
     // 离线对齐时把它前移 640 即可 —— 这正是官方离线版 `y[win_len*2:]` 做的事。

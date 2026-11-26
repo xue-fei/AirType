@@ -95,6 +95,26 @@ impl PcmBuffer {
 ///
 /// 返回整数而非 f32：`PipelineEvent` 派生了 `Eq`（f32 不实现 Eq），
 /// 且跨 ABI 传给 C++ 时整数比浮点更省心。
+/// S16LE 字节流转 i16 样本。奇数字节属于协议错误。
+pub fn le_bytes_to_i16(bytes: &[u8]) -> Result<Vec<i16>, AudioError> {
+    if bytes.len() % 2 != 0 {
+        return Err(AudioError::OddPayload(bytes.len()));
+    }
+    Ok(bytes
+        .chunks_exact(2)
+        .map(|p| i16::from_le_bytes([p[0], p[1]]))
+        .collect())
+}
+
+/// i16 样本转回 S16LE 字节流（降噪后重新组帧用）。
+pub fn i16_to_le_bytes(samples: &[i16]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(samples.len() * 2);
+    for s in samples {
+        out.extend_from_slice(&s.to_le_bytes());
+    }
+    out
+}
+
 pub fn frame_level(bytes: &[u8]) -> u16 {
     let count = bytes.len() / 2;
     if count == 0 {
