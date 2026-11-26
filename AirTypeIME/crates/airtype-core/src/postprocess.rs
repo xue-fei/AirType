@@ -48,6 +48,9 @@ impl PostProcessor {
         if self.cfg.normalize_english_case {
             s = normalize_english_case(&s);
         }
+        if self.cfg.space_cjk_latin {
+            s = space_cjk_latin(&s);
+        }
         if self.cfg.collapse_whitespace {
             s = remove_cjk_spaces(&s);
         }
@@ -160,6 +163,40 @@ fn is_cjk(c: char) -> bool {
         || ('\u{3000}'..='\u{303F}').contains(&c)
 }
 
+/// 在中文与英文单词之间补一个空格（`Is礼拜二` → `Is 礼拜二`）。
+///
+/// 只认「含字母的拉丁词」，所以 `3月`、`第2种`、`2026年` 这类数字+中文
+/// 保持原样（GB/T 15834 里数字与中文之间不加空格），而 `MP3音乐` →
+/// `MP3 音乐`（词里有字母，算中英混排）。
+fn space_cjk_latin(s: &str) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    let mut out = String::with_capacity(s.len() + 8);
+    for (i, c) in chars.iter().enumerate() {
+        if i > 0 && *c != ' ' {
+            let prev = chars[i - 1];
+            if prev != ' ' {
+                let need = (is_cjk(prev) && c.is_ascii_alphabetic())
+                    || (is_cjk(*c) && latin_word_has_alpha(&chars, i));
+                if need {
+                    out.push(' ');
+                }
+            }
+        }
+        out.push(*c);
+    }
+    out
+}
+
+/// `chars[..end]` 结尾那个拉丁词（ASCII 字母数字串）里有没有字母。
+/// 用来区分 `MP3`（该加空格）和 `3`（纯数字，不加）。
+fn latin_word_has_alpha(chars: &[char], end: usize) -> bool {
+    let mut i = end;
+    while i > 0 && chars[i - 1].is_ascii_alphanumeric() {
+        i -= 1;
+    }
+    chars[i..end].iter().any(|c| c.is_ascii_alphabetic())
+}
+
 /// 中文 ASR 结果里偶发字间空格，删掉夹在两个 CJK 字符之间的空格。
 fn remove_cjk_spaces(s: &str) -> String {
     let chars: Vec<char> = s.chars().collect();
@@ -235,6 +272,7 @@ mod tests {
             ensure_punctuation: false,
             collapse_whitespace: false,
             normalize_english_case: false,
+            space_cjk_latin: false,
         };
         assert_eq!(PostProcessor::new(cfg).process("嗯 你好"), "嗯 你好");
     }
@@ -272,5 +310,28 @@ mod tests {
         assert_eq!(normalize_english_case("I am A iPhone"), "I am A iPhone");
         // 含数字的词原样保留，别把 ES 之外的东西搅乱。
         assert_eq!(normalize_english_case("MP3 WAV"), "MP3 Wav");
+    }
+
+    #[test]
+    fn spaces_between_cjk_and_latin_words() {
+        // ASR 常把中英挤在一起：Is礼拜二 / Mon的
+        assert_eq!(space_cjk_latin("Is礼拜二 The"), "Is 礼拜二 The");
+        assert_eq!(space_cjk_latin("Mon的礼拜二"), "Mon 的礼拜二");
+        // 已有空格不重复插
+        assert_eq!(space_cjk_latin("Is 礼拜二"), "Is 礼拜二");
+        // 数字+中文是正常写法，不该插空格
+        assert_eq!(space_cjk_latin("第2种"), "第2种");
+        assert_eq!(space_cjk_latin("2026年11月"), "2026年11月");
+        // 词里含字母才算英文词：MP3音乐 要插，3月 不插
+        assert_eq!(space_cjk_latin("MP3音乐"), "MP3 音乐");
+    }
+
+    #[test]
+    fn end_to_end_mixed_language_sentence() {
+        // 热词修好"礼拜二"后的真实输出形态（ASR 原文没有中英之间的空格）
+        assert_eq!(
+            default_pp().process("昨天是 Monday Today Is礼拜二 The Day After Tomorrow是星期三"),
+            "昨天是 Monday Today Is 礼拜二 The Day After Tomorrow 是星期三。"
+        );
     }
 }

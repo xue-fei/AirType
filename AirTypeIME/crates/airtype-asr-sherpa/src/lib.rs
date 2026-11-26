@@ -52,6 +52,64 @@ pub struct ModelFiles {
 /// `model_dir` 为相对路径时的基准（两级）：
 ///   1. 进程当前目录（保持既有约定，源码树内 `models/...` 仍可用）；
 ///   2. 配置文件所在目录（TSF DLL 注入任意宿主进程后 CWD 不可控，必须兜底）。
+/// 读热词文件并净化：去掉空行、`#` 开头的注释、UTF-8 BOM。
+///
+/// 净化交给 sherpa 的解析器会崩（它把每行都当 `词 : 权重` 解析，注释行的
+/// `#` 走到 `std::stof` 就是 `invalid stof argument`），所以这里先处理干净。
+fn load_hotwords(path: &Path) -> Result<String, AsrError> {
+    let text = std::fs::read_to_string(path).map_err(|e| {
+        AsrError::Config(format!("读取热词文件 {} 失败: {e}", path.display()))
+    })?;
+    let mut out = String::new();
+    for line in text.lines() {
+        // 记事本存 UTF-8 会带 BOM，粘在第一个词前面会让它永远匹配不上。
+        let t = line.trim().trim_start_matches('\u{feff}').trim();
+        if t.is_empty() || t.starts_with('#') {
+            continue;
+        }
+        out.push_str(t);
+        out.push('\n');
+    }
+    Ok(out)
+}
+
+/// 解析热词文件路径。规则同 `model_dir`：绝对路径直接用，相对路径按
+/// 「CWD → 配置文件所在目录」依次尝试（TSF DLL 注入宿主后 CWD 不可控，
+/// 只按 CWD 找必失败）。
+fn resolve_hotwords(explicit: &str, base_dir: Option<&Path>) -> Result<PathBuf, AsrError> {
+    let raw = Path::new(explicit);
+    if raw.is_absolute() {
+        return if raw.is_file() {
+            Ok(raw.to_path_buf())
+        } else {
+            Err(AsrError::Config(format!(
+                "sherpa.hotwords_file 不存在: {}",
+                raw.display()
+            )))
+        };
+    }
+    let mut tried: Vec<PathBuf> = Vec::new();
+    if raw.is_file() {
+        return Ok(raw.to_path_buf());
+    }
+    tried.push(raw.to_path_buf());
+    if let Some(base) = base_dir {
+        let p = base.join(raw);
+        if p.is_file() {
+            return Ok(p);
+        }
+        tried.push(p);
+    }
+    let list = tried
+        .iter()
+        .map(|p| p.display().to_string())
+        .collect::<Vec<_>>()
+        .join("，");
+    Err(AsrError::Config(format!(
+        "sherpa.hotwords_file 找不到（已尝试: {list}）"
+    )))
+}
+
 pub fn resolve_model_files(cfg: &SherpaConfig, base_dir: Option<&Path>) -> Result<ModelFiles, AsrError> {
     let raw = Path::new(&cfg.model_dir);
     let dir: PathBuf = if raw.is_absolute() {
@@ -184,6 +242,42 @@ fn build_recognizer(cfg: &SherpaConfig, base_dir: Option<&Path>) -> Result<Onlin
     }
     config.decoding_method = Some(cfg.decoding_method.clone());
     config.enable_endpoint = cfg.enable_endpoint;
+
+    // 热词：只支持 modified_beam_search。配了热词却still走 greedy 时静默失效，
+    // 极难察觉，所以这里自动切过去并留日志。
+    if !cfg.hotwords_file.trim().is_empty() {
+        let hw = resolve_hotwords(&cfg.hotwords_file, base_dir)?;
+        let terms = load_hotwords(&hw)?;
+        if terms.is_empty() {
+            tracing::warn!(
+                file = %hw.display(),
+                "热词文件里没有有效词条（空行与 # 注释不计），本次不启用热词"
+            );
+        } else {
+            // sherpa 的 hotwords 解析器不认 # 注释，遇到就 std::stof 抛异常、
+            // 识别器直接创建失败（invalid stof argument）。所以自己读文件、
+            // 滤掉注释与空行，再以 buf 形式给它 —— 用户就能在词表里写注释。
+            config.hotwords_buf = Some(terms.into_bytes());
+            config.hotwords_score = cfg.hotwords_score;
+            if cfg.decoding_method != "modified_beam_search" {
+                tracing::warn!(
+                    configured = %cfg.decoding_method,
+                    "热词仅支持 modified_beam_search，已自动切换（max_active_paths=4）"
+                );
+                config.decoding_method = Some("modified_beam_search".into());
+            }
+            if config.max_active_paths <= 0 {
+                config.max_active_paths = 4;
+            }
+            tracing::info!(
+                file = %hw.display(),
+                score = cfg.hotwords_score,
+                paths = config.max_active_paths,
+                terms = config.hotwords_buf.as_ref().map_or(0, |b| b.iter().filter(|c| **c == b'\n').count()),
+                "热词已启用"
+            );
+        }
+    }
 
     OnlineRecognizer::create(&config).ok_or_else(|| {
         AsrError::Config(
