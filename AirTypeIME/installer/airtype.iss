@@ -1,4 +1,4 @@
-;----------------------------------------------------------------------
+﻿;----------------------------------------------------------------------
 ; AirType TSF 输入法 —— Inno Setup 6 安装脚本
 ;
 ; 替代原 7-Zip SFX + PowerShell 自提权方案，由正规安装器完成：
@@ -73,7 +73,13 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 Source: "dist\airtype_tsf.dll";       DestDir: "{app}\versions\{#VerDirName}"; Flags: ignoreversion regserver
 ; ffi 单独放 lib、所有版本共用：它 20MB，若跟着版本目录走，每个删不掉的历史
 ; 版本都会白占 20MB。外壳按 {app}\lib 优先、同目录兜底查找（见 FfiBridge.cpp）。
-Source: "dist\airtype_ffi.dll";       DestDir: "{app}\lib"; Flags: ignoreversion
+;
+; 文件名带构建戳 = 热重载的基础：宿主进程按需加载 DLL 后镜像常驻，替换同名文件
+; 不会影响它（Windows 不回首已加载的映像）。换文件名后，新进程/重载时能拿到新文件，
+; 旧文件继续被老进程持有直到退出。ffi-current.txt 告诉外壳"现在该用哪个"。
+; 外壳在输入法激活时比对戳，变化就 Unload + Load —— 升级后切一次输入法即生效。
+Source: "dist\airtype_ffi_{#BuildStamp}.dll"; DestDir: "{app}\lib"
+Source: "dist\ffi-current.txt";               DestDir: "{app}\lib"; Flags: ignoreversion
 Source: "dist\airtype_tsf_probe.exe"; DestDir: "{app}\versions\{#VerDirName}"; Flags: ignoreversion
 ; 配置与工具不随版本走（用户改过的配置要保留）。
 Source: "config\airtype.toml";        DestDir: "{app}\config"; Flags: onlyifdoesntexist
@@ -117,7 +123,61 @@ Filename: "powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -Fil
 ; 老配置的 [sherpa] 段缺热词两行，补上（已有则不动）
 Filename: "powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{app}\tools\enable_hotwords.ps1"""; Flags: runhidden waituntilterminated; StatusMsg: "配置热词表..."
 
+
 [Code]
+
+// 生成固定名 airtype_ffi.dll 的兼容副本。
+//
+// 为什么需要：热重载是新版外壳（160823 起）才有的逻辑。升级时，已经跑着的宿主
+// 进程仍持有**旧外壳**，它只会按固定名 airtype_ffi.dll 找 ffi。而安装过程会把这个
+// 固定名文件让路删掉，旧外壳一旦 Deactivate→Activate 就会找不到 —— 表现为输入法
+// 突然失效。复制一份副本兜住这个过渡窗口。
+//
+// 用复制而不是 [Files] 双份投放：安装包体积不翻倍。失败也只是少个回退文件，
+// 不影响新外壳（它走 ffi-current.txt）。
+procedure MakeFfiCompatCopy();
+var
+  Src, Dst: String;
+begin
+  Src := ExpandConstant('{app}\lib\airtype_ffi_{#BuildStamp}.dll');
+  Dst := ExpandConstant('{app}\lib\airtype_ffi.dll');
+  if not FileExists(Src) then
+    Exit;
+  if FileExists(Dst) then
+    Exit;   // 已存在就不动（可能是老版本留下的）
+  if CopyFile(Src, Dst, False) then
+    Log('已生成兼容副本 airtype_ffi.dll')
+  else
+    Log('兼容副本生成失败（可能被占用），跳过');
+end;
+
+
+// 删掉 lib 下**不是当前戳**的 airtype_ffi_*.dll。
+// 每个 20MB，不清理会随版本堆积（旧文件常被在跑的宿主进程锁着，删不掉就算了，
+// 下次安装再试）。当前戳必须保留。
+procedure CleanOldFfiFiles();
+var
+  FindRec: TFindRec;
+  Dir, Keep: String;
+begin
+  Dir := ExpandConstant('{app}\lib\');
+  Keep := 'airtype_ffi_' + ExpandConstant('{#BuildStamp}') + '.dll';
+  if FindFirst(Dir + 'airtype_ffi_*.dll', FindRec) then
+  try
+    repeat
+      if not SameText(FindRec.Name, Keep) then
+      begin
+        if DeleteFile(Dir + FindRec.Name) then
+          Log('清理旧 ffi：' + FindRec.Name)
+        else
+          Log('旧 ffi 被占用，跳过：' + FindRec.Name);
+      end;
+    until not FindNext(FindRec);
+  finally
+    FindClose(FindRec);
+  end;
+end;
+
 const
   TipKey         = 'SOFTWARE\Microsoft\CTF\TIP\{2A953F76-1683-47D8-BCA4-A4C9B3171A1F}\LanguageProfile\0x00000409';
   TipKeyWow      = 'SOFTWARE\WOW6432Node\Microsoft\CTF\TIP\{2A953F76-1683-47D8-BCA4-A4C9B3171A1F}\LanguageProfile\0x00000409';
@@ -575,6 +635,10 @@ begin
     PurgeStaleFiles('安装后');
     // 保留最近 2 个版本（当前 + 上一个），更老的删掉。
     PruneOldVersions;
+    // 给还没更新的旧外壳留个固定名回退副本。
+    MakeFfiCompatCopy;
+    // lib 下只留当前戳的 ffi，历史版本删掉（被占用就跳过）。
+    CleanOldFfiFiles;
     // 只有显式 /LAN=1 才把监听改成 0.0.0.0。
     ApplyLanBind;
   end;

@@ -38,6 +38,19 @@ public:
 
     bool Ready() const { return dll_ != nullptr; }
 
+    /// 卸载 DLL 并清空所有函数指针。
+    ///
+    /// **调用前必须确保 airtype_stop() 已返回**：stop 现在会同步等 tokio worker
+    /// 退出（shutdown_timeout），否则 FreeLibrary 之后还有线程在跑本模块代码，
+    /// 会踩到已解除映射的代码页直接崩进程。
+    void Unload();
+
+    /// 加载时磁盘上的版本戳（{app}\lib\ffi-current.txt）。空 = 老布局，不参与热重载。
+    const std::wstring& LoadedStamp() const { return loaded_stamp_; }
+
+    /// 读磁盘**当前**的版本戳。与 LoadedStamp() 不同就说明装了新版本。
+    static std::wstring DiskStamp();
+
     /// 最近一次失败的描述（来自 DLL 的 airtype_last_error 或本地图加载失败）。
     std::string LastError() const { return last_error_; }
 
@@ -61,6 +74,7 @@ private:
 
     HMODULE dll_ = nullptr;
     std::string last_error_;
+    std::wstring loaded_stamp_;
 
     FnVersion version_ = nullptr;
     FnInit init_ = nullptr;

@@ -978,6 +978,23 @@ bool TsfTextService::StartCore() {
     if (stopping_) {
         return false;
     }
+
+    // ---- ffi 热重载 ----
+    // 安装器把新 ffi 写成 lib\airtype_ffi_<戳>.dll 并更新 lib\ffi-current.txt。
+    // 这里比对「已加载的戳」与「磁盘上的戳」，不同就卸载旧模块重新加载。
+    // 触发时机是输入法被激活（Activate -> StartCore），所以升级后**切一下输入法**
+    // 就生效，不需要重启宿主进程。
+    // 之所以能安全卸载：airtype_stop() 现在会同步等 tokio worker 退出。
+    if (ffi_.Ready()) {
+        const std::wstring disk = FfiBridge::DiskStamp();
+        if (!disk.empty() && disk != ffi_.LoadedStamp()) {
+            airtype::log("检测到 ffi 内核更新，热重载（旧=%ls 新=%ls）",
+                         ffi_.LoadedStamp().empty() ? L"(无)" : ffi_.LoadedStamp().c_str(),
+                         disk.c_str());
+            ffi_.Unload();
+        }
+    }
+
     if (!ffi_.Load()) {
         airtype::log("airtype_ffi.dll 加载失败: %s", ffi_.LastError().c_str());
         return false;

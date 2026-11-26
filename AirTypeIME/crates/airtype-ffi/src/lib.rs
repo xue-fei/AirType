@@ -300,7 +300,11 @@ pub extern "C" fn airtype_stop() {
     };
     // 关 runtime 放到锁外，避免持锁等待 worker 退出时阻塞回调侧的 guard drop。
     if let Some(rt) = rt {
-        rt.shutdown_background();
+        // 必须**同步**等 worker 退出。原来用 shutdown_background() 立即返回，
+        // 之后调用方一旦 FreeLibrary 卸载本模块，还在跑的 worker 线程就会踩到
+        // 已解除映射的代码页 —— 直接崩进程。这也是"热重载 DLL"必须的前提。
+        // 5s 足够一次正常推理收尾；真超时说明卡死了，此时放弃等待并记录。
+        rt.shutdown_timeout(std::time::Duration::from_secs(5));
     }
 }
 

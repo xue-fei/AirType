@@ -81,6 +81,16 @@ Log '源文件齐全。' 'Green'
 # 不需要重启宿主（老进程用老目录、新进程用新目录）。
 $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
 Log "构建戳：$stamp（产物将装到 versions\<版本>-$stamp）" 'Cyan'
+
+# ---- 版本化 ffi（热重载支持）----
+# 文件名带构建戳：安装后即使宿主进程仍持有旧镜像，也能从磁盘加载到新文件。
+# ffi-current.txt 是"当前该用哪个"的指针，TSF 外壳在输入法激活时比对它，
+# 不同就卸载旧模块重新加载 —— 所以升级后切一次输入法即可，不必重启宿主。
+$ffiSrc = Join-Path $Dist 'airtype_ffi.dll'
+$ffiDst = Join-Path $Dist "airtype_ffi_$stamp.dll"
+Copy-Item -LiteralPath $ffiSrc -Destination $ffiDst -Force
+Set-Content -LiteralPath (Join-Path $Dist 'ffi-current.txt') -Value $stamp -Encoding ascii -NoNewline
+Log "ffi 版本化：airtype_ffi_$stamp.dll + ffi-current.txt" 'Cyan'
 Log '编译 Inno Setup 安装包...' 'Cyan'
 & $iscc "/DBuildStamp=$stamp" $Iss 2>&1 | ForEach-Object { Write-Host $_ }
 if ($LASTEXITCODE -ne 0) { Fail "ISCC 编译失败（exit=$LASTEXITCODE）" }
