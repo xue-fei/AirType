@@ -420,6 +420,63 @@ bool GetCaretRectViaUia(RECT& out) {
 //   · UIA 不可用或调用失败 —— 放行。宁可多显示，也不因为查不到而误隐藏。
 //
 // 结果缓存 120ms：焦点切换本就有延迟，40ms 轮询下没必要每拍都走 UIA。
+// 容器型控件：宿主没做细粒度可访问性时，UIA 只能给到窗口/面板/分组。
+// 典型如微信（Qt）——输入框不报 Edit 类型、不实现任何 Text/Value pattern，
+// GetFocusedElement 直接落到 Window 上。这类只能交给定位环节决定显示与否。
+bool IsContainerControl(CONTROLTYPEID type) {
+    switch (type) {
+        case UIA_WindowControlTypeId:
+        case UIA_PaneControlTypeId:
+        case UIA_GroupControlTypeId:
+        case UIA_CustomControlTypeId:  // 自定义控件可能是输入框，按容器对待
+            return true;
+        default:
+            return false;
+    }
+}
+
+// 明显不是文本输入的控件。用于兜底放行时排除，避免点按钮/菜单也弹图标。
+bool IsObviouslyNonTextControl(CONTROLTYPEID type) {
+    switch (type) {
+        case UIA_AppBarControlTypeId:
+        case UIA_ButtonControlTypeId:
+        case UIA_CalendarControlTypeId:
+        case UIA_CheckBoxControlTypeId:
+        case UIA_DataGridControlTypeId:
+        case UIA_DataItemControlTypeId:
+        case UIA_HeaderControlTypeId:
+        case UIA_HeaderItemControlTypeId:
+        case UIA_HyperlinkControlTypeId:
+        case UIA_ImageControlTypeId:
+        case UIA_ListControlTypeId:
+        case UIA_ListItemControlTypeId:
+        case UIA_MenuControlTypeId:
+        case UIA_MenuBarControlTypeId:
+        case UIA_MenuItemControlTypeId:
+        case UIA_ProgressBarControlTypeId:
+        case UIA_RadioButtonControlTypeId:
+        case UIA_ScrollBarControlTypeId:
+        case UIA_SemanticZoomControlTypeId:
+        case UIA_SeparatorControlTypeId:
+        case UIA_SliderControlTypeId:
+        case UIA_SpinnerControlTypeId:
+        case UIA_SplitButtonControlTypeId:
+        case UIA_StatusBarControlTypeId:
+        case UIA_TabControlTypeId:
+        case UIA_TabItemControlTypeId:
+        case UIA_TableControlTypeId:
+        case UIA_ThumbControlTypeId:
+        case UIA_TitleBarControlTypeId:
+        case UIA_ToolBarControlTypeId:
+        case UIA_ToolTipControlTypeId:
+        case UIA_TreeControlTypeId:
+        case UIA_TreeItemControlTypeId:
+            return true;
+        default:
+            return false;
+    }
+}
+
 bool FocusIsTextEditable() {
     static CComPtr<IUIAutomation> uia;
     static bool have_result = false;
@@ -456,18 +513,64 @@ bool FocusIsTextEditable() {
         FAILED(focused->get_CurrentProcessId(&focused_pid)) ||
         focused_pid == static_cast<int>(GetCurrentProcessId());
 
+    BOOL focusable = FALSE;
+    BOOL has_focus = FALSE;
+    const bool have_focus_state =
+        SUCCEEDED(focused->get_CurrentIsKeyboardFocusable(&focusable)) &&
+        SUCCEEDED(focused->get_CurrentHasKeyboardFocus(&has_focus));
+
+    bool text_pattern = false;
+    bool edit_pattern = false;
+    bool value_writable = false;
+
     bool editable = false;
     if (pid_ok) {
+        // ① 标准文本控件类型。
         editable = type == UIA_EditControlTypeId || type == UIA_DocumentControlTypeId ||
                    type == UIA_ComboBoxControlTypeId;
-        if (!editable) {
+
+        // ② TextPattern（Slate/Chromium 富文本）或 TextEditPattern
+        //    （Qt/自绘编辑器的常见形态）。要求 focusable，避免把只读的静态
+        //    文本容器当输入框。
+        if (!editable && focusable) {
             CComPtr<IUIAutomationTextPattern> tp;
-            if (SUCCEEDED(focused->GetCurrentPatternAs(UIA_TextPatternId,
-                                                       IID_IUIAutomationTextPattern,
-                                                       reinterpret_cast<void**>(&tp))) &&
-                tp) {
+            CComPtr<IUIAutomationTextEditPattern> te;
+            if ((SUCCEEDED(focused->GetCurrentPatternAs(UIA_TextPatternId,
+                                                        IID_IUIAutomationTextPattern,
+                                                        reinterpret_cast<void**>(&tp))) &&
+                 tp)) {
+                text_pattern = true;
+                editable = true;
+            } else if ((SUCCEEDED(focused->GetCurrentPatternAs(
+                           UIA_TextEditPatternId, IID_IUIAutomationTextEditPattern,
+                           reinterpret_cast<void**>(&te))) &&
+                       te)) {
+                edit_pattern = true;
                 editable = true;
             }
+        }
+
+        // ③ ValuePattern 且可写：有些自绘输入框只暴露 Value。
+        //    查不到 ReadOnly 就按只读处理，宁可漏放行也不误放行。
+        if (!editable && focusable) {
+            CComPtr<IUIAutomationValuePattern> vp;
+            if (SUCCEEDED(focused->GetCurrentPatternAs(
+                    UIA_ValuePatternId, IID_IUIAutomationValuePattern,
+                    reinterpret_cast<void**>(&vp))) &&
+                vp) {
+                BOOL readonly = TRUE;
+                if (FAILED(vp->get_CurrentIsReadOnly(&readonly))) {
+                    readonly = TRUE;
+                }
+                value_writable = !readonly;
+                editable = value_writable;
+            }
+        }
+
+        // ④ 兜底：宿主什么都不上报时（典型微信），只要能拿键盘焦点就放行。
+        //    容器型（Window/Pane/Group/Custom）一律放行交给定位；其余走黑名单。
+        if (!editable && have_focus_state && has_focus && focusable) {
+            editable = IsContainerControl(type) || !IsObviouslyNonTextControl(type);
         }
     }
 
@@ -475,13 +578,30 @@ bool FocusIsTextEditable() {
     have_result = true;
     last_tick = now;
 #ifdef AIRTYPE_TRACE_STATUS
-    // 只在状态翻转时打印：40ms 轮询下每条都写会把日志刷爆（单日已 8MB）。
+    // 只在状态翻转时打印：25Hz 轮询下每条都写会把日志刷爆（单日曾 8MB）。
+    // 详情也只在翻转时取（Name/ClassName 要走跨进程属性读取，不便宜）。
     static bool last_logged = true;
     if (last_logged != editable) {
         if (!pid_ok) {
             airtype::log("[焦点] 焦点在其它进程 pid=%d -> 隐藏图标", focused_pid);
+        } else if (editable) {
+            BSTR name = nullptr;
+            BSTR cls = nullptr;
+            focused->get_CurrentName(&name);
+            focused->get_CurrentClassName(&cls);
+            airtype::log("[焦点] 判定=可编辑 type=%ld(%s) name='%s' cls='%s' "
+                         "focusable=%d hasfocus=%d text=%d edit=%d value=%d",
+                         static_cast<LONG>(type),
+                         IsContainerControl(type) ? "容器" : "控件",
+                         name ? WideToUtf8(name).c_str() : "",
+                         cls ? WideToUtf8(cls).c_str() : "", focusable ? 1 : 0,
+                         has_focus ? 1 : 0, text_pattern ? 1 : 0, edit_pattern ? 1 : 0,
+                         value_writable ? 1 : 0);
+            SysFreeString(name);
+            SysFreeString(cls);
         } else {
-            airtype::log("[焦点] 非文本控件 type=%ld -> 隐藏图标", static_cast<LONG>(type));
+            airtype::log("[焦点] 非文本控件 type=%ld focusable=%d hasfocus=%d -> 隐藏图标",
+                         static_cast<LONG>(type), focusable ? 1 : 0, has_focus ? 1 : 0);
         }
         last_logged = editable;
     }
@@ -1142,6 +1262,9 @@ STDMETHODIMP TsfTextService::OnUninitDocumentMgr(ITfDocumentMgr* /*dim*/) {
 }
 
 STDMETHODIMP TsfTextService::OnSetFocus(ITfDocumentMgr* focus, ITfDocumentMgr* /*previous*/) {
+    // 诊断：微信这类宿主是否真的建立过 TSF 焦点文档，直接决定能否用
+    // GetTextExt 精确定位（UIA 与 Win32 caret 在它上面都拿不到东西）。
+    airtype::log("OnSetFocus doc=%p", static_cast<void*>(focus));
     current_doc_ = focus;
     // 只有真正换了文档才丢弃写入范围。
     // OnSetFocus 会在一次语音段内被反复触发（点击输入框、TSF 重建隐式文档、

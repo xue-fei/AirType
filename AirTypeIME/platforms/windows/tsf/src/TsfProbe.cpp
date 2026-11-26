@@ -847,6 +847,176 @@ int RunUia() {
     return 0;
 }
 
+
+// 只读布局探测会话：在编辑会话内取插入符/选区的屏幕矩形。
+//
+// 用途：UIA 与 Win32 caret 都拿不到光标的宿主（典型微信/Qt），看它是否通过
+// TSF 提供 layout。这是唯一的精确来源，所以单独做成探针命令，先验证再决定
+// 要不要接进正式定位链路。
+class CaretProbeSession : public ITfEditSession {
+public:
+    CaretProbeSession(ITfContext* ctx, TfClientId tid) : ctx_(ctx), tid_(tid) {}
+
+    // IUnknown
+    STDMETHODIMP QueryInterface(REFIID riid, void** ppv) override {
+        if (ppv == nullptr) return E_INVALIDARG;
+        if (riid == IID_IUnknown || riid == IID_ITfEditSession) {
+            *ppv = static_cast<ITfEditSession*>(this);
+            AddRef();
+            return S_OK;
+        }
+        *ppv = nullptr;
+        return E_NOINTERFACE;
+    }
+    STDMETHODIMP_(ULONG) AddRef() override { return ++ref_; }
+    STDMETHODIMP_(ULONG) Release() override {
+        const ULONG r = --ref_;
+        if (r == 0) delete this;
+        return r;
+    }
+
+    // ITfEditSession
+    STDMETHODIMP DoEditSession(TfEditCookie ec) override {
+        CComPtr<ITfContextView> view;
+        const HRESULT view_hr = ctx_->GetActiveView(&view);
+
+        TF_SELECTION sel{};
+        ULONG fetched = 0;
+        const HRESULT sel_hr = ctx_->GetSelection(ec, TF_DEFAULT_SELECTION, 1, &sel, &fetched);
+
+        airtype::log("  [会话] view_hr=0x%08X sel_hr=0x%08X fetched=%lu has_view=%d",
+                     static_cast<unsigned>(view_hr), static_cast<unsigned>(sel_hr),
+                     static_cast<unsigned long>(fetched), static_cast<int>(view != nullptr));
+
+        if (SUCCEEDED(sel_hr) && fetched > 0 && sel.range != nullptr && view != nullptr) {
+            CComPtr<ITfRange> selected;
+            selected.Attach(sel.range);  // 接管所有权
+
+            // ① 折叠成插入符
+            CComPtr<ITfRange> caret;
+            if (SUCCEEDED(selected->Clone(&caret)) &&
+                SUCCEEDED(caret->Collapse(ec, TF_ANCHOR_END))) {
+                RECT rc{};
+                BOOL clipped = FALSE;
+                const HRESULT hr = view->GetTextExt(tid_, caret, &rc, &clipped);
+                airtype::log("  [会话] GetTextExt(折叠) -> 0x%08X rect=(%d,%d,%d,%d) w=%d h=%d "
+                             "clipped=%d", static_cast<unsigned>(hr), rc.left, rc.top,
+                             rc.right, rc.bottom, rc.right - rc.left, rc.bottom - rc.top,
+                             static_cast<int>(clipped));
+            } else {
+                airtype::log("  [会话] Clone/Collapse 失败");
+            }
+
+            // ② 不折叠，直接用真实 range（有些 provider 只对非空 range 给坐标）
+            RECT rc2{};
+            BOOL clipped2 = FALSE;
+            const HRESULT hr2 = view->GetTextExt(tid_, selected, &rc2, &clipped2);
+            airtype::log("  [会话] GetTextExt(原始) -> 0x%08X rect=(%d,%d,%d,%d) w=%d h=%d "
+                         "clipped=%d", static_cast<unsigned>(hr2), rc2.left, rc2.top,
+                         rc2.right, rc2.bottom, rc2.right - rc2.left,
+                         rc2.bottom - rc2.top, static_cast<int>(clipped2));
+        }
+        return S_OK;
+    }
+
+private:
+    ~CaretProbeSession() = default;
+
+    CComPtr<ITfContext> ctx_;
+    TfClientId tid_;
+    ULONG ref_ = 1;
+};
+
+// 验证当前焦点宿主的 TSF layout 可用性。异步优先（不阻塞宿主），再看同步。
+int RunTsfExt() {
+    airtype::log("=== TSF layout 探测（当前系统焦点宿主）===");
+    HRESULT hr = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+    if (FAILED(hr) && hr != RPC_E_CHANGED_MODE) {
+        airtype::log_hr("CoInitializeEx(STA)", hr);
+        return 1;
+    }
+
+    CComPtr<ITfThreadMgr> thread_mgr;
+    hr = CoCreateInstance(CLSID_TF_ThreadMgr, nullptr, CLSCTX_INPROC_SERVER, IID_ITfThreadMgr,
+                          reinterpret_cast<void**>(&thread_mgr));
+    if (FAILED(hr) || !thread_mgr) {
+        airtype::log_hr("CoCreateInstance(ITfThreadMgr)", hr);
+        CoUninitialize();
+        return 1;
+    }
+
+    TfClientId client_id = 0;
+    hr = thread_mgr->Activate(&client_id);
+    if (FAILED(hr)) {
+        airtype::log_hr("ITfThreadMgr::Activate", hr);
+        CoUninitialize();
+        return 1;
+    }
+
+    HWND fg = GetForegroundWindow();
+    wchar_t title[256]{};
+    if (fg != nullptr) {
+        GetWindowTextW(fg, title, 256);
+    }
+    airtype::log("前台窗口: hwnd=%p title=%s", static_cast<void*>(fg),
+                 utf16_to_utf8(title).c_str());
+
+    CComPtr<ITfDocumentMgr> doc;
+    hr = thread_mgr->GetFocus(&doc);
+    airtype::log_hr("ITfThreadMgr::GetFocus", hr);
+    if (FAILED(hr) || !doc) {
+        airtype::log("拿不到焦点文档管理器（当前线程没有 TSF 焦点）");
+        thread_mgr->Deactivate();
+        CoUninitialize();
+        return 1;
+    }
+
+    CComPtr<ITfContext> ctx;
+    hr = doc->GetTop(&ctx);
+    airtype::log_hr("ITfDocumentMgr::GetTop", hr);
+    if (FAILED(hr) || !ctx) {
+        thread_mgr->Deactivate();
+        CoUninitialize();
+        return 1;
+    }
+
+    // 先异步：不阻塞宿主 UI 线程，代价是部分宿主（Chromium）只在同步下就绪布局。
+    airtype::log("--- ASYNC 会话 ---");
+    {
+        auto* session = new CaretProbeSession(ctx, client_id);
+        HRESULT session_hr = E_FAIL;
+        const HRESULT req =
+            ctx->RequestEditSession(client_id, session, TF_ES_ASYNC | TF_ES_READ, &session_hr);
+        airtype::log_hr("RequestEditSession(ASYNC)", req);
+        airtype::log_hr("  排队结果", session_hr);
+        session->Release();
+    }
+    // 泵消息，等异步回调投递回本线程。
+    MSG msg{};
+    for (int i = 0; i < 200; ++i) {
+        while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+        Sleep(10);
+    }
+
+    airtype::log("--- SYNC 会话 ---");
+    {
+        auto* session = new CaretProbeSession(ctx, client_id);
+        HRESULT session_hr = E_FAIL;
+        const HRESULT req =
+            ctx->RequestEditSession(client_id, session, TF_ES_SYNC | TF_ES_READ, &session_hr);
+        airtype::log_hr("RequestEditSession(SYNC)", req);
+        airtype::log_hr("  DoEditSession", session_hr);
+        session->Release();
+    }
+
+    thread_mgr->Deactivate();
+    CoUninitialize();
+    return 0;
+}
+
 int RunShotFg(const std::string& path_utf8) {
     const std::wstring path = utf8_to_utf16(path_utf8);
     airtype::log("=== 抓取整块屏幕 ===");
@@ -1252,6 +1422,7 @@ int main(int argc, char** argv) {
     DWORD deactivate_flags = 0;
     bool cursor = false;
     bool uia = false;
+    bool tsf_ext = false;
     std::string shotfg_path;
     std::string status_preview_path;
     int status_preview_level = 0;
@@ -1283,6 +1454,8 @@ int main(int argc, char** argv) {
             cursor = true;
         } else if (strcmp(argv[i], "--uia") == 0) {
             uia = true;
+        } else if (strcmp(argv[i], "--tsf-ext") == 0) {
+            tsf_ext = true;
         } else if (strcmp(argv[i], "--shotfg") == 0 && i + 1 < argc) {
             shotfg_path = argv[++i];
         } else if (strcmp(argv[i], "--status-preview") == 0 && i + 1 < argc) {
@@ -1306,6 +1479,9 @@ int main(int argc, char** argv) {
     }
     if (uia) {
         return RunUia();
+    }
+    if (tsf_ext) {
+        return RunTsfExt();
     }
     if (!shotfg_path.empty()) {
         return RunShotFg(shotfg_path);
