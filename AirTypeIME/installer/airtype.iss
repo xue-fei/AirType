@@ -20,6 +20,23 @@
 #define MyCLSID        "{2A953F76-1683-47D8-BCA4-A4C9B3171A1F}"
 #define MyProfile      "{0C4CE702-4B69-4BC4-96AF-47EC0DA70E2A}"
 
+; ---- 版本目录隔离 ----
+; 为什么每次安装用一个独一无二的目录：TSF 外壳是 in-proc DLL，被注入
+; explorer / 微信 / chrome 后常驻，文件句柄一直被持有 —— 原地覆盖必然失败
+; （DeleteFile 拿不到），只能改名成 .old 绕过，用户得重启宿主才能用上新版。
+; 搜狗/QQ 输入法正是靠「装到新版本目录 + 改注册表指针」做到免重启：
+; 老进程继续用老目录的文件（没被碰过），新进程加载新目录，互不干扰。
+;
+; BuildStamp 由 build_inno.ps1 在编译时用 /DBuildStamp=yyyyMMdd-HHmm 传入，
+; 保证同版本号反复构建也能落到不同目录（否则又会退化成原地覆盖）。
+#ifndef BuildStamp
+  #define BuildStamp "dev"
+#endif
+; 注意用表达式拼接（MyAppVersion + "-" + BuildStamp），不能写成
+; "{#MyAppVersion}-{#BuildStamp}"——ISPP 的 #define 不会递归展开值里的 {#...}，
+; 那串会原样残留，被 Inno 当成运行时常量报 "Unknown constant #MyAppVersion"。
+#define VerDirName     MyAppVersion + "-" + BuildStamp
+
 [Setup]
 AppId={{2A953F76-1683-47D8-BCA4-A4C9B3171A1F}
 AppName={#MyAppName}
@@ -49,11 +66,14 @@ Name: "chinese"; MessagesFile: "compiler:Languages\ChineseSimplified.isl"
 Name: "english"; MessagesFile: "compiler:Default.isl"
 
 [Files]
-; regserver: 安装时 DllRegisterServer，卸载时 DllUnregisterServer
-; ignoreversion: 覆盖旧 DLL，不比对版本（源码构建没有版本资源）
-Source: "dist\airtype_tsf.dll";       DestDir: "{app}"; Flags: ignoreversion regserver
-Source: "dist\airtype_ffi.dll";       DestDir: "{app}"; Flags: ignoreversion
-Source: "dist\airtype_tsf_probe.exe"; DestDir: "{app}"; Flags: ignoreversion
+; 可执行产物装进 versions\<版本>-<构建戳>\：每次都是全新目录，从不覆盖
+; 已有文件，所以不会被宿主进程锁住、也不需要让路改名成 .old。
+; regserver 的标志仍然有效——DllRegisterServer 用 GetModuleFileName 取自身
+; 路径，注册表 InprocServer32 会自动指向新版本目录，老进程不受影响。
+Source: "dist\airtype_tsf.dll";       DestDir: "{app}\versions\{#VerDirName}"; Flags: ignoreversion regserver
+Source: "dist\airtype_ffi.dll";       DestDir: "{app}\versions\{#VerDirName}"; Flags: ignoreversion
+Source: "dist\airtype_tsf_probe.exe"; DestDir: "{app}\versions\{#VerDirName}"; Flags: ignoreversion
+; 配置与工具不随版本走（用户改过的配置要保留）。
 Source: "config\airtype.toml";        DestDir: "{app}\config"; Flags: onlyifdoesntexist
 Source: "tools\simulate_voice.ps1";   DestDir: "{app}\tools"; Flags: ignoreversion
 Source: "tools\close_status.ps1";     DestDir: "{app}\tools"; Flags: ignoreversion
@@ -61,7 +81,14 @@ Source: "VERIFY.md";                  DestDir: "{app}"; Flags: ignoreversion
 ; 内嵌 sherpa-onnx fp32 模型（encoder/decoder/joiner/tokens.txt/bpe.model，约 458MB）。
 ; 只打 fp32：resolve_model_files 明确跳过量化文件，int8 版约 209MB 不装。
 ; 缺模型时 engine = "sherpa" 会在输入法激活时报 model_dir 不是目录，无法识别。
-Source: "..\models\sherpa-onnx-streaming-zipformer-bilingual-zh-en-2023-02-20\*"; DestDir: "{app}\models\sherpa-onnx-streaming-zipformer-bilingual-zh-en-2023-02-20"; Flags: ignoreversion recursesubdirs createallsubdirs; Excludes: "*.int8.onnx"
+; onlyifdoesntexist：模型 458MB 且内容不变，已存在就跳过，重复安装省几分钟。
+Source: "..\models\sherpa-onnx-streaming-zipformer-bilingual-zh-en-2023-02-20\*"; DestDir: "{app}\models\sherpa-onnx-streaming-zipformer-bilingual-zh-en-2023-02-20"; Flags: ignoreversion onlyifdoesntexist recursesubdirs createallsubdirs; Excludes: "*.int8.onnx"
+
+[UninstallDelete]
+; 旧版本目录不在 [Files] 里，Inno 不会自动删，必须显式声明。
+Type: filesandordirs; Name: "{app}\versions"
+Type: filesandordirs; Name: "{app}\models"
+Type: filesandordirs; Name: "{app}\config"
 
 [Code]
 const
@@ -200,54 +227,177 @@ begin
   MoveAsideOne('airtype_ffi.dll');
 end;
 
+// 从旧版「根目录平铺布局」升级上来时，清掉根目录那三个可执行产物。
+// 它们已被 versions\ 取代；tsf/ffi 若仍被老进程占用，MoveAsideLockedFiles
+// 已经把改名成 .old、随后的 PurgeStaleFiles 会收拾，这里主要处理探针。
+procedure PurgeLegacyRootFiles;
+var
+  Dir: string;
+  Names: array[0..2] of string;
+  I: Integer;
+begin
+  Dir := ExpandConstant('{app}');
+  Names[0] := 'airtype_tsf.dll';
+  Names[1] := 'airtype_ffi.dll';
+  Names[2] := 'airtype_tsf_probe.exe';
+  for I := 0 to 2 do
+  begin
+    if FileExists(Dir + '\' + Names[I]) then
+    begin
+      if DeleteFile(Dir + '\' + Names[I]) then
+        Log(Format('已清理旧布局文件：%s', [Names[I]]))
+      else
+        Log(Format('旧布局文件暂被占用：%s', [Names[I]]));
+    end;
+  end;
+end;
+
 // 机器级注册（regserver）不等于「对用户启用」：还要把 profile 写进当前用户的
 // 输入法列表，任务栏 / Win+空格 才会出现 AirType。probe 走官方接口
 // ITfInputProcessorProfileMgr::ActivateProfile / DeactivateProfile。
 // 失败只记日志，不阻断安装 / 卸载（顶多任务栏里没有，不影响已装好的服务）。
+// 探针现在装在版本目录里。安装阶段直接按本次的版本目录名拼；
+// 卸载阶段那个名字可能已经对不上（卸载器不知道自己属于哪个版本目录），
+// 所以退一步读注册表 InprocServer32 —— 它永远指向当前生效的那份 DLL。
+function ProbePath(): string;
+var
+  P, DllPath: string;
+begin
+  P := ExpandConstant('{app}\versions\{#VerDirName}\airtype_tsf_probe.exe');
+  if FileExists(P) then
+  begin
+    Result := P;
+    Exit;
+  end;
+  if RegQueryStringValue(HKEY_LOCAL_MACHINE,
+       'SOFTWARE\Classes\CLSID\{2A953F76-1683-47D8-BCA4-A4C9B3171A1F}\InprocServer32',
+       '', DllPath) then
+  begin
+    P := ExtractFilePath(DllPath) + 'airtype_tsf_probe.exe';
+    if FileExists(P) then
+    begin
+      Result := P;
+      Exit;
+    end;
+  end;
+  Result := '';
+end;
+
 procedure RunProbe(const Params: string);
 var
   Code: Integer;
+  Probe: string;
 begin
-  if not Exec(ExpandConstant('{app}\airtype_tsf_probe.exe'), Params, '', SW_HIDE,
-              ewWaitUntilTerminated, Code) then
+  Probe := ProbePath();
+  if Probe = '' then
+  begin
+    Log(Format('probe %s -> 跳过（找不到 airtype_tsf_probe.exe）', [Params]));
+    Exit;
+  end;
+  if not Exec(Probe, Params, '', SW_HIDE, ewWaitUntilTerminated, Code) then
   begin
     Code := -1;
   end;
   Log(Format('probe %s -> exit %d', [Params, Code]));
 end;
 
-// 旁路文件（MoveAsideLockedFiles 改名出来的 .old / .old.N）会在 install /
-// uninstall 反复进行下越积越多（实测单目录 6 个共 60MB）。这里做一次通配清扫。
+// 清理安装目录里的历史残留：*.old*（让路副本）、is-*.tmp（Inno 中断残留）。
 //
-// 为什么在 ssPostInstall 也要清：卸载只删固定名 .old，带序号的 .old.N 从不处理；
-// 而安装阶段被注入进程锁住的文件此刻也删不掉。放到 ssPostInstall，此时
-// RestartExplorer 刚执行、旧 explorer 已退出，占用概率最低。
-procedure CleanupAsideFiles;
+// ⚠️ 旧实现的根本缺陷：删不掉时就「留在原地 + 登记重启删除」。文件仍在
+//    {app} 里，而用户动辄一两周不重启（本机实测连续运行 148 小时），于是
+//    .old/.old.N 常年堆在安装目录、每次升级再递增一个编号——用户看到的
+//    「一堆 .old」就是这么来的。别的输入法要么走系统更新（重启替换），
+//    要么在安装前强制结束宿主，不会把垃圾留在安装目录。
+//
+// 新策略：删不掉（被已注入的进程占用）就**同卷改名搬到系统临时目录**。
+// Windows 允许重命名已加载的映像文件（MoveAsideLockedFiles 本身就靠这个
+// 让路），所以这一步几乎总能成功；安装目录当场干净，被占用的副本留在
+// {tmp} 由系统或下次重启回收。只有连改名都失败才退回「仅登记重启删除」。
+procedure PurgePattern(const Dir, Pattern: string; var nDel, nMoved, nReg: Integer);
 var
   FindRec: TFindRec;
-  Dir, SelfPath: string;
-  n: Integer;
+  Src, Dst: string;
 begin
-  Dir := ExpandConstant('{app}');
-  n := 0;
-  if FindFirst(Dir + '\*.old*', FindRec) then
-  begin
-    try
-      repeat
-        if (FindRec.Attributes and FILE_ATTRIBUTE_DIRECTORY) = 0 then
+  if not FindFirst(Dir + '\' + Pattern, FindRec) then
+    Exit;
+  try
+    repeat
+      if (FindRec.Attributes and FILE_ATTRIBUTE_DIRECTORY) = 0 then
+      begin
+        Src := Dir + '\' + FindRec.Name;
+        if DeleteFile(Src) then
         begin
-          SelfPath := Dir + '\' + FindRec.Name;
-          if DeleteFile(SelfPath) then
+          Inc(nDel);
+        end
+        else
+        begin
+          Dst := ExpandConstant('{tmp}') + '\stale_' + FindRec.Name;
+          if FileExists(Dst) then
+            DeleteFile(Dst);
+          if RenameFile(Src, Dst) then
           begin
-            n := n + 1;
-            Log(Format('已清理旁路文件：%s', [FindRec.Name]));
+            Inc(nMoved);
+            // 副本留在临时目录也会被占，登记重启删除兜底。
+            MoveFileEx(Dst, '', MOVEFILE_DELAY_UNTIL_REBOOT or MOVEFILE_REPLACE_EXISTING);
+            Log(Format('  移出安装目录：%s -> {tmp}', [FindRec.Name]));
           end
           else
           begin
-            // 删除失败（多为仍被注入进程占用）：登记到 PendingFileRenameOperations，
-            // 下次开机由系统零弹窗清除，不影响当前使用。
-            MoveFileEx(SelfPath, '', MOVEFILE_DELAY_UNTIL_REBOOT or MOVEFILE_REPLACE_EXISTING);
-            Log(Format('旁路文件暂被占用，已登记为重启后删除：%s', [FindRec.Name]));
+            Inc(nReg);
+            MoveFileEx(Src, '', MOVEFILE_DELAY_UNTIL_REBOOT or MOVEFILE_REPLACE_EXISTING);
+            Log(Format('  改名也失败，仅登记重启删除：%s', [FindRec.Name]));
+          end;
+        end;
+      end;
+    until not FindNext(FindRec);
+  finally
+    FindClose(FindRec);
+  end;
+end;
+
+// 清理孤儿卸载器：Inno 升级安装有时无法复用旧的 unins000.exe（当时被占用），
+// 会新建 unins001.exe 并把注册表指向它，旧的那份就永远留成 4.4MB 垃圾。
+// 只在「注册表确实指向另一个卸载器」时删旧的，避免误删当前卸载器。
+procedure PurgeOrphanUninstallers;
+var
+  Dir, CurName, CurDat, Uninst, Cand: string;
+  FindRec: TFindRec;
+  n: Integer;
+begin
+  Dir := ExpandConstant('{app}');
+  CurName := '';
+  if RegQueryStringValue(HKEY_LOCAL_MACHINE,
+       'SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\{2A953F76-1683-47D8-BCA4-A4C9B3171A1F}_is1',
+       'UninstallString', Uninst) then
+  begin
+    Uninst := RemoveQuotes(Uninst);
+    CurName := ExtractFileName(Uninst);
+  end;
+
+  if CurName = '' then
+  begin
+    Log('孤儿卸载器清理：读不到当前 UninstallString，跳过');
+    Exit;
+  end;
+
+  // 当前卸载器有 .exe 和 .dat 两个文件，都在保护名单里。
+  CurDat := ChangeFileExt(CurName, '.dat');
+
+  n := 0;
+  if FindFirst(Dir + '\unins*.*', FindRec) then
+  begin
+    try
+      repeat
+        Cand := FindRec.Name;
+        if (FindRec.Attributes and FILE_ATTRIBUTE_DIRECTORY) = 0 then
+        begin
+          if (CompareText(Cand, CurName) <> 0) and (CompareText(Cand, CurDat) <> 0) then
+          begin
+            if DeleteFile(Dir + '\' + Cand) then
+            begin
+              Inc(n);
+              Log(Format('  删除孤儿卸载器文件：%s', [Cand]));
+            end;
           end;
         end;
       until not FindNext(FindRec);
@@ -255,7 +405,89 @@ begin
       FindClose(FindRec);
     end;
   end;
-  Log(Format('旁路文件清理完成，本次直接删除 %d 个。', [n]));
+  Log(Format('孤儿卸载器清理：删除 %d 个（当前 = %s）', [n, CurName]));
+end;
+
+procedure PurgeStaleFiles(const Phase: string);
+var
+  Dir: string;
+  nDel, nMoved, nReg: Integer;
+begin
+  Dir := ExpandConstant('{app}');
+  nDel := 0;
+  nMoved := 0;
+  nReg := 0;
+  PurgePattern(Dir, '*.old*', nDel, nMoved, nReg);
+  PurgePattern(Dir, 'is-*.tmp', nDel, nMoved, nReg);
+  if Phase = '安装后' then
+    PurgeOrphanUninstallers;
+  // 注意：Format 的参数数组不能换行到行首——.iss 解析器会把行首的 '[' 误判为
+  // section 标记（"Invalid section tag"）。必须与 Format 同行。
+  Log(Format('[%s] 残留清理：删除 %d，移出安装目录 %d，仅登记重启 %d', [Phase, nDel, nMoved, nReg]));
+end;
+
+// 版本目录只留「当前 + 最近一个」共 2 个。
+//
+// 为什么留一个旧的：升级时老进程（微信/Chrome）还映射着上一个版本的文件，
+// 那份必须留着让它继续跑；等它们都退出后，下一次安装再清掉。
+//
+// 删不掉（仍被占用）就原样保留，下次再试——**绝不登记重启删除**，
+// 那正是 .old 堆积的老毛病（排队几个月都执行不了）。
+procedure PruneOldVersions;
+var
+  FindRec: TFindRec;
+  Root, CurName, Tmp: string;
+  Names: array[0..63] of string;
+  Count, I, J, Removed: Integer;
+begin
+  Root := ExpandConstant('{app}\versions');
+  CurName := '{#VerDirName}';
+  Count := 0;
+  if FindFirst(Root + '\*', FindRec) then
+  begin
+    try
+      repeat
+        if (FindRec.Attributes and FILE_ATTRIBUTE_DIRECTORY) <> 0 then
+        begin
+          if (CompareText(FindRec.Name, CurName) <> 0) and
+             (FindRec.Name <> '.') and (FindRec.Name <> '..') then
+          begin
+            if Count <= High(Names) then
+            begin
+              Names[Count] := FindRec.Name;
+              Count := Count + 1;
+            end;
+          end;
+        end;
+      until not FindNext(FindRec);
+    finally
+      FindClose(FindRec);
+    end;
+  end;
+
+  // 目录名 = 版本号 + 构建时间戳，同一版本内字典序即时间序；冒泡降序。
+  for I := 0 to Count - 2 do
+    for J := 0 to Count - 2 - I do
+      if CompareText(Names[J], Names[J + 1]) < 0 then
+      begin
+        Tmp := Names[J];
+        Names[J] := Names[J + 1];
+        Names[J + 1] := Tmp;
+      end;
+
+  // Names[0] 是最新的旧版本，留着给未重启的进程用；从索引 1 开始删。
+  Removed := 0;
+  for I := 1 to Count - 1 do
+  begin
+    if DelTree(Root + '\' + Names[I], True, True, True) then
+    begin
+      Inc(Removed);
+      Log(Format('已删除旧版本目录：%s', [Names[I]]));
+    end
+    else
+      Log(Format('旧版本目录仍被占用，保留到下次：%s', [Names[I]]));
+  end;
+  Log(Format('版本目录清理：非当前 %d 个，删除 %d 个，保留 1 个', [Count, Removed]));
 end;
 
 procedure CurStepChanged(CurStep: TSetupStep);
@@ -263,7 +495,14 @@ begin
   if CurStep = ssInstall then
   begin
     RemoveLegacyEnProfile;
+    // 先清历史残留再让路：否则 MoveAsideOne 会在旧 .old.N 之上继续递增编号，
+    // 目录里的垃圾只增不减（这曾经是本机堆出 60MB 旁路文件的直接原因）。
+    PurgeStaleFiles('安装前');
+    // 版本目录隔离后不再覆盖任何在用文件，这里只用于「从旧版根目录布局
+    // 升级上来」时清掉根目录那对旧 DLL —— 新布局下两个文件都不存在，空操作。
     MoveAsideLockedFiles;
+    // 让路之后再清根目录残留（probe 从没被加载过，能直接删）。
+    PurgeLegacyRootFiles;
   end;
   if CurStep = ssPostInstall then
   begin
@@ -272,8 +511,10 @@ begin
     // 关键一步：启用到当前用户列表，否则任务栏看不到 AirType。
     RunProbe('--enable');
     RestartExplorer;
-    // 清掉本次及历史遗留的旁路文件（删除失败 = 仍被占用，忽略即可）。
-    CleanupAsideFiles;
+    // 清掉本次/历史遗留的旁路副本。
+    PurgeStaleFiles('安装后');
+    // 保留最近 2 个版本（当前 + 上一个），更老的删掉。
+    PruneOldVersions;
   end;
 end;
 
@@ -288,9 +529,9 @@ begin
   if CurUninstallStep = usPostUninstall then
   begin
     RemoveLegacyEnProfile;
-    // 清理 MoveAsideLockedFiles 留下的旁路文件（.old / .old.N），
-    // 换用通配匹配，避免只删固定名导致 .old.N 越积越多。
-    CleanupAsideFiles;
+    // 清理 MoveAsideLockedFiles 留下的旁路副本（.old / .old.N），
+    // 删不掉的一律移出安装目录，不在 {app} 里留垃圾。
+    PurgeStaleFiles('卸载后');
     RestartExplorer;
   end;
 end;

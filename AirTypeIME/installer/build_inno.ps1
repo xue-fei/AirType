@@ -69,8 +69,13 @@ Log "模型就位：$modelDir（fp32 约 $modelSize MB，安装包将明显变�
 Log '源文件齐全。' 'Green'
 
 # ---------- 3. 编译 ----------
+# 版本目录名 = 版本号 + 构建戳。必须每次唯一：TSF 外壳是 in-proc DLL，
+# 被宿主进程常驻锁定，只有落到全新目录才不会覆盖到在用文件，装完也就
+# 不需要重启宿主（老进程用老目录、新进程用新目录）。
+$stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+Log "构建戳：$stamp（产物将装到 versions\<版本>-$stamp）" 'Cyan'
 Log '编译 Inno Setup 安装包...' 'Cyan'
-& $iscc $Iss 2>&1 | ForEach-Object { Write-Host $_ }
+& $iscc "/DBuildStamp=$stamp" $Iss 2>&1 | ForEach-Object { Write-Host $_ }
 if ($LASTEXITCODE -ne 0) { Fail "ISCC 编译失败（exit=$LASTEXITCODE）" }
 
 $exe = Get-ChildItem -LiteralPath $Dist -Filter 'AirType-Setup-*-x64-inno.exe' -File |
