@@ -111,13 +111,17 @@ bool IsAirTypeActiveKeyboard() {
 bool GetCaretRectViaUia(RECT& out) {
     // UIA 客户端调用要求调用线程已初始化 COM。本函数只在 STA 线程执行
     // （异步编辑会话回调投递回同一 STA），语义安全。
-    CComPtr<IUIAutomation> uia;
-    HRESULT hr = CoCreateInstance(CLSID_CUIAutomation, nullptr, CLSCTX_INPROC_SERVER,
-                                  IID_IUIAutomation, reinterpret_cast<void**>(&uia));
-    if (FAILED(hr) || !uia) {
-        TRACE_UA("[定位②.5] UIA CoCreateInstance 失败 0x%08X", static_cast<unsigned>(hr));
+    // 缓存 UIA 实例：每次 CoCreateInstance 要几十毫秒，而定位是 120ms 一拍。
+    // 只在轮询线程访问，无需加锁（与 FocusIsTextEditable 的缓存同样的前提）。
+    static CComPtr<IUIAutomation> uia;
+    if (!uia &&
+        (FAILED(CoCreateInstance(CLSID_CUIAutomation, nullptr, CLSCTX_INPROC_SERVER,
+                                 IID_IUIAutomation, reinterpret_cast<void**>(&uia))) ||
+         !uia)) {
+        TRACE_UA("[定位②.5] UIA CoCreateInstance 失败");
         return false;
     }
+    HRESULT hr = S_OK;
 
     CComPtr<IUIAutomationElement> focused;
     hr = uia->GetFocusedElement(&focused);
@@ -1248,55 +1252,18 @@ void TsfTextService::UpdateStatusPosition() {
         status_.Hide();
         return;
     }
-    CComPtr<ITfDocumentMgr> doc = current_doc_;
-    if (!doc && FAILED(thread_mgr_->GetFocus(&doc))) {
-        // 微信等 Qt 程序在没开始打字时拿不到 TSF 文档。不能在这里静默 return，
-        // 否则图标永远停在「创建即隐藏」状态（切到 AirType 完全没显示）。
-#ifdef AIRTYPE_TRACE_STATUS
-        airtype::log("[定位] TSF 无焦点文档 -> UIA 独立路径");
-#endif
-        UpdateStatusViaUiaOnly(status_);
-        return;
-    }
-    if (!doc) {
-#ifdef AIRTYPE_TRACE_STATUS
-        airtype::log("[定位] TSF 焦点文档为空 -> UIA 独立路径");
-#endif
-        UpdateStatusViaUiaOnly(status_);
-        return;
-    }
-    CComPtr<ITfContext> ctx;
-    if (FAILED(doc->GetTop(&ctx)) || !ctx) {
-#ifdef AIRTYPE_TRACE_STATUS
-        airtype::log("[定位] TSF 无上下文 -> UIA 独立路径");
-#endif
-        UpdateStatusViaUiaOnly(status_);
-        return;
-    }
-    // 递增代次：排队期间若有更新的请求发出，这次查询回来时会被丢弃，
-    // 避免旧坐标晚到把图标拖回上一帧的位置（异步化后必须配的代次闸门）。
-    const LONG generation = ++status_.generation;
-
-    auto* query = new CaretQuerySession(ctx, client_id_, &status_, generation);
-    HRESULT session_hr = E_FAIL;
-    // 必须 TF_ES_SYNC：Chromium（Chrome / WorkBuddy / VSCode）只在同步会话里
-    // 保证文档布局已就绪，异步会话调 GetTextExt 恒返回 TF_E_NOLAYOUT
-    // （实测 0x80040201、rect 全零）。微软拼音等商业输入法同样走同步会话。
+    // 定位**完全在轮询线程用 UIA 完成，不走 TSF 编辑会话**。
     //
-    // 代价是同步会话会在目标进程 UI 线程上等 TSF 发编辑凭证，应用忙时会卡住。
-    // 所以轮询间隔从 40ms 放宽到 kStatusPollIntervalMs，用低频换不卡顿。
-    const HRESULT hr = ctx->RequestEditSession(client_id_, query,
-                                               TF_ES_SYNC | TF_ES_READ, &session_hr);
-    query->Release();  // RequestEditSession 已 AddRef；会话结束会释放它自己那份
-    if (FAILED(hr)) {
-        // 某些应用拒绝只读会话：改走 UIA 独立路径，别让图标停在隐藏状态。
-#ifdef AIRTYPE_TRACE_STATUS
-        airtype::log("[定位] RequestEditSession 失败 0x%08X -> UIA 独立路径",
-                     static_cast<unsigned>(hr));
-#endif
-        UpdateStatusViaUiaOnly(status_);
-        return;
-    }
+    // 这里踩过一次严重的坑：原先用 RequestEditSession(TF_ES_SYNC) 把
+    // DoEditSession 投递到宿主 UI 线程执行，而 DoEditSession 内部又调 UIA
+    // （跨进程 RPC，需要宿主 UI 线程响应）。SYNC 时调用方阻塞等凭证、宿主
+    // UI 线程等 UIA 回复，两边互等 —— 宿主表现为「未响应」，轮询越频繁越糟。
+    //
+    // 改回走 UIA 独立路径的理由不只是规避死锁：TSF GetTextExt 对 Chromium
+    // 恒返回 TF_E_NOLAYOUT（它的 layout_changed_ 只在有 IME 组字时置位），
+    // 留着这条路径没有任何收益，只剩风险。UIA 字符级扩展已经能拿到
+    // 1px 宽的光标竖线矩形，精度足够。
+    UpdateStatusViaUiaOnly(status_);
 }
 
 void TsfTextService::FlushPending() {
