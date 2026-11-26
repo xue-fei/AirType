@@ -146,6 +146,70 @@ bool GetCaretRectViaUia(RECT& out) {
         BOOL caret_active = FALSE;
         hr = tp2->GetCaretRange(&caret_active, &caret);
         if (SUCCEEDED(hr) && caret) {
+            // Chromium（Chrome/WorkBuddy/VSCode）对退化 range 返回**空矩形数组**，
+            // 但对非空 range 会给。所以拿不到时把光标范围扩展成整行再试一次：
+            // y 能精确到行底，x 退化为行首（仍比"输入框正中"贴近实际光标）。
+            auto rect_of = [](IUIAutomationTextRange* r, RECT& o) -> bool {
+                SAFEARRAY* arr = nullptr;
+                if (FAILED(r->GetBoundingRectangles(&arr)) || arr == nullptr) {
+                    return false;
+                }
+                bool ok = false;
+                if (static_cast<LONG>(arr->rgsabound[0].cElements) >= 4) {
+                    double* data = nullptr;
+                    if (SUCCEEDED(SafeArrayAccessData(arr, reinterpret_cast<void**>(&data))) &&
+                        data != nullptr) {
+                        const double l = data[0], t = data[1], w = data[2], h = data[3];
+                        SafeArrayUnaccessData(arr);
+                        if (h > 0.0) {
+                            o.left = static_cast<LONG>(l);
+                            o.right = static_cast<LONG>(l + (w > 0.0 ? w : 0.0));
+                            o.top = static_cast<LONG>(t);
+                            o.bottom = static_cast<LONG>(t + h);
+                            ok = true;
+                        }
+                    }
+                }
+                SafeArrayDestroy(arr);
+                return ok;
+            };
+
+            if (rect_of(caret, out)) {
+                TRACE_UA("[定位②.5] caret 矩形 rect=(%d,%d,%d,%d)", out.left, out.top,
+                         out.right, out.bottom);
+                return true;
+            }
+            // ①.2 文字级：把光标扩展成「包含它的一个字符」。非空 range 能拿到矩形，
+            //     再用 CompareEndpoints 判断光标在字符左侧还是右侧，得到像素级 caret x。
+            CComPtr<IUIAutomationTextRange> ch;
+            if (SUCCEEDED(caret->Clone(&ch)) && ch != nullptr &&
+                SUCCEEDED(ch->ExpandToEnclosingUnit(TextUnit_Character))) {
+                RECT cr{};
+                if (rect_of(ch, cr)) {
+                    int cmp = 1;
+                    if (SUCCEEDED(ch->CompareEndpoints(TextPatternRangeEndpoint_Start, caret,
+                                                       TextPatternRangeEndpoint_Start, &cmp)) &&
+                        cmp != 0) {
+                        // cmp != 0：caret 落在字符内部或之后，用字符右边界当插入点。
+                        cr.left = cr.right;
+                    }
+                    out = cr;
+                    TRACE_UA("[定位②.5] 字符范围 rect=(%d,%d,%d,%d) cmp=%d", out.left,
+                             out.top, out.right, out.bottom, cmp);
+                    return true;
+                }
+            }
+
+            // ①.3 行级：字符级也不行时退到整行，至少 y 是准的。
+            CComPtr<IUIAutomationTextRange> line;
+            if (SUCCEEDED(caret->Clone(&line)) && line != nullptr &&
+                SUCCEEDED(line->ExpandToEnclosingUnit(TextUnit_Line)) && rect_of(line, out)) {
+                TRACE_UA("[定位②.5] caret 扩展成行 rect=(%d,%d,%d,%d)", out.left, out.top,
+                         out.right, out.bottom);
+                return true;
+            }
+            TRACE_UA("[定位②.5] caret 与整行均无矩形");
+
             SAFEARRAY* arr = nullptr;
             hr = caret->GetBoundingRectangles(&arr);
             if (SUCCEEDED(hr) && arr != nullptr) {
@@ -265,12 +329,18 @@ bool GetCaretRectViaUia(RECT& out) {
     const LONG ur_h = ur.bottom - ur.top;
     const LONG ur_w = ur.right - ur.left;
     if (editable && SUCCEEDED(hr) && ur_w > 0 && ur_h > 0 && ur_h <= 200) {
-        out.left = ur.left;
-        out.top = ur.top;
-        out.right = ur.right;
-        out.bottom = ur.bottom;
-        TRACE_UA("[定位②.5] 用输入框矩形 rect=(%d,%d,%d,%d)", ur.left, ur.top,
-                 ur.right, ur.bottom);
+        // 连字符级都拿不到矩形时，只能给一个"点"。
+        // 取输入框**左下内侧**而不是矩形整体：FollowCaret 用矩形中心 x 落点，
+        // 传整个框会让图标跑到框正中（用户实测就是这么发现的）。
+        // 左下角大致对齐实际打字起点，视觉上比正中合理得多。
+        const LONG px = ur.left + 24;   // 半个图标宽 + 边距，让图标左缘贴近框左边
+        const LONG py = ur.bottom - 6;
+        out.left = px;
+        out.top = py - 18;
+        out.right = px;
+        out.bottom = py;
+        TRACE_UA("[定位②.5] 无文本矩形，退到输入框左下角 (%ld,%ld) 框=(%d,%d,%d,%d)", px,
+                 py, ur.left, ur.top, ur.right, ur.bottom);
         return true;
     }
     TRACE_UA("[定位②.5] 放弃矩形 type=%ld editable=%d hr=0x%08X rect=(%d,%d,%d,%d)",
@@ -468,11 +538,10 @@ void UpdateStatusViaUiaOnly(StatusWindow& status) {
 // 只读查询会话：拿当前选区（折叠后即插入符）的屏幕矩形，定位状态图标。
 // GetTextExt 必须在 edit session 内调用；某些应用不给真实坐标时回退 Win32 caret。
 //
-// 为什么是异步会话（TF_ES_ASYNC）：原实现用 TF_ES_SYNC，会在**目标进程的 UI
-// 线程上原地等待** TSF 内部发编辑凭证。应用忙、上下文被锁、或正在滚动重排时，
-// 这一等就是几十到几百毫秒——表现为悬浮图标"卡住不动、然后猛地跳一下"。
-// 改异步后 DoEditSession 仍在请求线程（STA）执行，能直接更新分层窗口，但不再
-// 阻塞调用方。配合 StatusWindow::generation 丢弃过期结果，避免旧坐标晚到把图标拖回去。
+// 会话标志用 TF_ES_SYNC，原因见调用点：Chromium 只在同步会话里保证布局就绪，
+// 异步会话下 GetTextExt 恒返回 TF_E_NOLAYOUT。同步的代价是可能在目标进程 UI
+// 线程上等凭证，故把轮询间隔放宽到 120ms 来换流畅。
+// 配合 StatusWindow::generation 丢弃过期结果，避免旧坐标晚到把图标拖回去。
 class CaretQuerySession : public ITfEditSession {
 public:
     CaretQuerySession(ITfContext* ctx, TfClientId tid, StatusWindow* status, LONG generation)
@@ -959,7 +1028,8 @@ void TsfTextService::StopCore() {
 // 跟随轮询间隔。原来是 300ms——输入框移动/光标跳动时，图标最多要等 300ms 才
 // 更新一次，视觉上就是"拖着走、一顿一顿"。40ms（25Hz）接近人眼连续感，
 // 配合 StatusWindow 的坐标去重与异步编辑会话，静止时几乎零开销。
-constexpr DWORD kStatusPollIntervalMs = 40;
+// 120ms：同步编辑会话有阻塞风险，用低频换流畅（40ms 是异步时代的取值）。
+constexpr DWORD kStatusPollIntervalMs = 120;
 
 void TsfTextService::StartStatusPolling() {
     if (status_poll_thread_.joinable()) {
@@ -1209,11 +1279,14 @@ void TsfTextService::UpdateStatusPosition() {
 
     auto* query = new CaretQuerySession(ctx, client_id_, &status_, generation);
     HRESULT session_hr = E_FAIL;
-    // TF_ES_ASYNC：不阻塞目标进程 UI 线程。这是"输入框移动时跟随卡顿"的主因修复——
-    // 原来的 TF_ES_SYNC 会在 UI 线程上原地等 TSF 发编辑凭证，应用忙/滚动重排时
-    // 一卡就是几十到几百毫秒，图标表现为"卡住不动然后猛地跳一下"。
+    // 必须 TF_ES_SYNC：Chromium（Chrome / WorkBuddy / VSCode）只在同步会话里
+    // 保证文档布局已就绪，异步会话调 GetTextExt 恒返回 TF_E_NOLAYOUT
+    // （实测 0x80040201、rect 全零）。微软拼音等商业输入法同样走同步会话。
+    //
+    // 代价是同步会话会在目标进程 UI 线程上等 TSF 发编辑凭证，应用忙时会卡住。
+    // 所以轮询间隔从 40ms 放宽到 kStatusPollIntervalMs，用低频换不卡顿。
     const HRESULT hr = ctx->RequestEditSession(client_id_, query,
-                                               TF_ES_ASYNC | TF_ES_READ, &session_hr);
+                                               TF_ES_SYNC | TF_ES_READ, &session_hr);
     query->Release();  // RequestEditSession 已 AddRef；会话结束会释放它自己那份
     if (FAILED(hr)) {
         // 某些应用拒绝只读会话：改走 UIA 独立路径，别让图标停在隐藏状态。
