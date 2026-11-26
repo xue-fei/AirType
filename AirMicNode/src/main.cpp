@@ -22,6 +22,7 @@
 #include "provisioning.h"
 #include "ptt_button.h"
 #include "status_led.h"
+#include "web_upload.h"
 #include "wifi_manager.h"
 
 namespace {
@@ -33,6 +34,7 @@ PttButton   button;
 StatusLed   led;
 WifiManager wifi;
 NetClient   net;
+WebUpload   web;
 
 DeviceState g_state            = DeviceState::Idle;
 uint16_t    g_seq              = 0;
@@ -45,6 +47,7 @@ uint32_t    g_cancelUntilMs    = 0;
 uint32_t    g_bootUntilMs      = 0;
 uint32_t    g_framesSent       = 0;
 bool        g_waitingRelease   = false;  // 超时强制结束后，等真实松键
+bool        g_webStarted       = false;  // STA 连上后起一次网页服务
 String      g_deviceId;
 
 uint16_t nextSeq() {
@@ -168,6 +171,10 @@ void handleButton(uint32_t now) {
             markError();
             return;
         }
+        if (web.busy()) {
+            Serial.println("[PTT] 网页上传中，忽略按键");
+            return;
+        }
         if (g_state == DeviceState::Uploading) {
             Serial.println("[PTT] 上一段仍在识别，忽略按键");
             return;
@@ -251,6 +258,8 @@ void updateLed(uint32_t now) {
         led.set(LedState::WifiConnecting);
     } else if (g_state == DeviceState::Recording) {
         led.set(LedState::Recording);
+    } else if (web.busy()) {
+        led.set(LedState::Uploading);
     } else if (g_state == DeviceState::Uploading) {
         led.set(LedState::Uploading);
     } else if (!net.connected()) {
@@ -266,14 +275,16 @@ void printStats(uint32_t now) {
         return;
     }
     g_lastStatsMs = now;
-    Serial.printf("[STAT] heap=%uKB / 已发音频帧=%lu / 队列丢帧=%lu / "
-                  "RSSI=%ddBm / Wi-Fi=%s / WS=%s\n",
+    Serial.printf("[STAT] heap=%uKB / psram=%uKB / 已发音频帧=%lu / 队列丢帧=%lu / "
+                  "RSSI=%ddBm / Wi-Fi=%s / WS=%s / WEB=%s\n",
                   static_cast<unsigned>(ESP.getFreeHeap() / 1024),
+                  static_cast<unsigned>(ESP.getFreePsram() / 1024),
                   static_cast<unsigned long>(g_framesSent),
                   static_cast<unsigned long>(audio.dropped()),
                   WiFi.RSSI(),
                   wifi.connected() ? "up" : "down",
-                  net.connected() ? "up" : "down");
+                  net.connected() ? "up" : "down",
+                  web.stateName());
 }
 
 }  // namespace
@@ -359,6 +370,18 @@ void loop() {
     if (wifi.poll()) {
         Serial.println("[WiFi] 重新联网，重建 WebSocket 连接");
         net.restart();
+    }
+
+    // STA 连上后起一次网页服务（断线重连不用重启，IP 变化时页面按新地址访问）
+    if (!g_webStarted && wifi.connected()) {
+        g_webStarted = true;
+        web.begin(&net, &g_seq, g_deviceId);
+        Serial.printf("[WEB] 上传页 http://%s/ （未接麦克风时的替代输入）\n",
+                      WiFi.localIP().toString().c_str());
+    }
+    web.loop();
+    if (web.consumeError()) {
+        markError();
     }
 
     handleButton(now);

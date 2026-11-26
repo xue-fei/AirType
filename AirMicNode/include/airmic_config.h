@@ -108,3 +108,13 @@ static constexpr uint32_t WIFI_RETRY_MS     = 3000;
 static constexpr uint32_t WS_RECONNECT_MS   = 2000;
 static constexpr uint32_t ERROR_LED_MS      = 2000;  // 错误灯效持续时间
 static constexpr uint32_t STATS_INTERVAL_MS = 15000; // 串口打印堆/丢帧统计
+
+// ---- 网页上传（没接麦克风 / PTT 时的替代输入，见 web_upload.cpp）--------------
+// STA 连上后起 WebServer：录音页 + /upload（multipart 文件）+ /api/state。
+// 收到的 WAV 剥掉头存进 PSRAM，再按协议帧重放给 daemon。
+static constexpr uint16_t WEB_PORT            = 80;         // 网页服务端口
+static constexpr size_t   WEB_PCM_MAX_BYTES   = 1500 * 1024;  // PCM 缓冲上限 ≈ 46.9s
+static constexpr size_t   WEB_PSRAM_MARGIN    = 256 * 1024;   // 给协议栈/String 留的余量
+static constexpr uint32_t WEB_REPLAY_GAP_MS   = 10;           // 重放每帧间隔（比实时快）
+static constexpr uint32_t WEB_RECEIVE_TIMEOUT_MS = 30000;     // 半途断开的看门狗
+static constexpr size_t   WEB_WAV_OVERHEAD_MAX = 2 * 1024;    // multipart 外层开销估算
